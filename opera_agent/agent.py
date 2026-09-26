@@ -1,16 +1,17 @@
 """Natural-language agent: "process the files in X" → geotagged GoPro frames.
 
-Gemini plans and calls the pipeline tools; the fieldprocessing repository is retrieved
-(RAG) when it needs to know how the original workflow does something."""
+Gemini (or Qwen via OpenRouter when Gemini is busy, see llm.py) plans and calls the pipeline tools;
+the fieldprocessing repository is retrieved (RAG) when it needs to know how the original workflow does something."""
 from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
+from .llm import DEFAULT_GEMINI as DEFAULT_LLM, TransientLLMError, make_backend
 from .tools import TOOLS, ToolRunner
 
-DEFAULT_LLM = "gemini-2.5-flash"
 FIELD_REPO = "https://github.com/philspaceagency/sdmad-opera-fieldprocessing.git"
 
 SYSTEM = """You operate PhilSA's OpERA field-processing pipeline for underwater benthic surveys:
@@ -39,17 +40,29 @@ Be concise. Give exact paths and numbers. Never invent paths or results."""
 
 
 class OperaAgent:
-    def __init__(self, data_root: str | None = None, llm_model: str = DEFAULT_LLM, api_key: str | None = None,
+    """provider: "gemini" (default) or "openrouter" (Qwen via OpenRouter, key in OPENROUTER_API_KEY).
+    fallback: when the primary model stays busy (rate limit / overload / network) after `retries`, the same
+    conversation continues on the fallback. "auto" = Qwen on OpenRouter if OPENROUTER_API_KEY is set,
+    "openrouter" = always, None = no fallback. Each new request tries the primary model first again."""
+
+    def __init__(self, data_root: str | None = None, llm_model: str | None = None, api_key: str | None = None,
                  rag=None, docs_index: str | None = None, model_path: str | None = None,
-                 verbose: bool = True, max_steps: int = 25):
-        from google import genai
-        self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
-        self.llm_model, self.data_root, self.verbose, self.max_steps = llm_model, data_root, verbose, max_steps
+                 verbose: bool = True, max_steps: int = 25, provider: str = "gemini",
+                 fallback: str | None = "auto", fallback_model: str | None = None, retries: int = 2,
+                 backend=None, fallback_backend=None):
+        self.data_root, self.verbose, self.max_steps, self.retries = data_root, verbose, max_steps, retries
+        self.backend = backend or make_backend(provider, llm_model, api_key)
+        if fallback_backend is None and fallback and provider != "openrouter":
+            if fallback == "openrouter" or os.environ.get("OPENROUTER_API_KEY"):
+                fallback_backend = make_backend("openrouter", fallback_model)
+        self.fallback = fallback_backend
+        self._sleep = time.sleep
         model_path = model_path or os.environ.get("OPERA_YOLO_MODEL")
         if rag is None:
             rag = self._load_docs(docs_index)
         self.tools = ToolRunner(rag=rag, default_model_path=model_path, log=self._log)
-        self.messages: list = []   # list of google.genai.types.Content
+        self.messages: list[dict] = []   # provider-neutral history (see llm.py)
+        self._log(f"LLM: {self.backend.name}" + (f" (fallback: {self.fallback.name})" if self.fallback else ""))
 
     # -------------------------------------------------------------- docs (RAG)
     @staticmethod
@@ -71,41 +84,54 @@ class OperaAgent:
             print(msg)
 
     # -------------------------------------------------------------- main loop
+    def _complete(self, system: str) -> dict:
+        """Ask the active model; on a transient error retry with backoff, then move to the fallback."""
+        chain = [self.backend] + ([self.fallback] if self.fallback else [])
+        err = None
+        for i in range(self._active, len(chain)):
+            b = chain[i]
+            for attempt in range(self.retries + 1):
+                try:
+                    return b.complete(system, self.messages, TOOLS)
+                except TransientLLMError as e:
+                    err = e
+                    if attempt < self.retries:
+                        wait = 2 ** (attempt + 1)
+                        self._log(f"  {b.name} unavailable ({str(e)[:120]}); retrying in {wait}s")
+                        self._sleep(wait)
+            if i + 1 < len(chain):
+                self._log(f"  {b.name} still unavailable → switching to {chain[i + 1].name}")
+                self._active = i + 1
+        raise err
+
     def run(self, request: str) -> str:
         """Send a request; the agent calls tools until it has an answer. Keeps the
         conversation, so follow-ups ("yes, use UTC", "now classify them") work."""
-        from google.genai import types
-
         system = SYSTEM + (f"\nData root (search here first): {self.data_root}" if self.data_root else "")
         system += ("\nYOLO model configured: classification runs after geotagging." if self.tools.default_model_path
                    else "\nNo YOLO model configured: classification is unavailable unless the user gives model_path.")
-        config = types.GenerateContentConfig(system_instruction=system, max_output_tokens=4000,
-                                             tools=[types.Tool(function_declarations=TOOLS)])
-        self.messages.append(types.Content(role="user", parts=[types.Part(text=request)]))
+        self.messages.append({"role": "user", "content": request})
+        self._active = 0                                   # every request tries the primary model first
         for _ in range(self.max_steps):
-            resp = self.client.models.generate_content(model=self.llm_model, contents=self.messages, config=config)
-            cand = resp.candidates[0] if resp.candidates else None
-            if cand is None or cand.content is None or not cand.content.parts:
-                reason = getattr(cand, "finish_reason", None) if cand else getattr(resp, "prompt_feedback", None)
-                return f"Gemini returned no content (finish reason: {reason})."
-            content = cand.content
-            self.messages.append(content)
-            calls = [p.function_call for p in content.parts if p.function_call]
-            if not calls:
-                return "".join(p.text for p in content.parts if p.text)
-            response_parts = []
-            for c in calls:
-                args = dict(c.args or {})
-                self._log(f"→ {c.name}({json.dumps(args, ensure_ascii=False)[:200]})")
-                out = self.tools(c.name, args)
+            try:
+                res = self._complete(system)
+            except TransientLLMError as e:
+                return f"No model available right now ({e}). Try again in a few minutes."
+            if res["message"] is None:
+                return res["text"]
+            self.messages.append(res["message"])
+            if not res["tool_calls"]:
+                return res["text"]
+            for c in res["tool_calls"]:
+                self._log(f"→ {c['name']}({json.dumps(c['args'], ensure_ascii=False)[:200]})")
+                out = self.tools(c["name"], c["args"])
                 if "error" in out:
                     self._log(f"  ! {out['error']}")
                 dumped = json.dumps(out, default=str)          # plain JSON types only (no Path/numpy)
-                payload = json.loads(dumped) if len(dumped) <= 20000 else {"truncated": True, "preview": dumped[:20000]}
-                # Part.from_function_response() has no `id` argument; build the Part directly
-                response_parts.append(types.Part(function_response=types.FunctionResponse(
-                    name=c.name, response={"result": payload}, id=getattr(c, "id", None))))
-            self.messages.append(types.Content(role="user", parts=response_parts))
+                if len(dumped) > 20000:
+                    dumped = json.dumps({"truncated": True, "preview": dumped[:20000]})
+                self.messages.append({"role": "tool", "tool_call_id": c["id"], "name": c["name"],
+                                      "content": dumped, "_gemini_id": c.get("gemini_id")})
         return "Stopped: too many steps without finishing."
 
     def reset(self):

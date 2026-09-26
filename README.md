@@ -68,6 +68,7 @@ Put the weights in `models/` (see `models/README.md`).
 pip install -r requirements.txt          # plus ffmpeg on the PATH
 pip install -r requirements-yolo.txt     # only for benthic classification (adds ultralytics + PyTorch)
 export GEMINI_API_KEY=...
+export OPENROUTER_API_KEY=...             # optional: Qwen fallback when Gemini is busy
 python -m opera_agent --data-root /data/surveys "process the 13MAY2025 survey"
 python -m opera_agent --chat --data-root /data/surveys
 
@@ -104,6 +105,21 @@ tests/              pytest; runs without ffmpeg, a GPU or ultralytics
 ```
 
 Run the tests with `pip install pytest pillow && pytest`.
+
+## Language model: Gemini with a Qwen fallback
+
+The agent uses Gemini by default. If `OPENROUTER_API_KEY` is set and Gemini keeps returning rate-limit,
+overload or network errors (after 2 retries, 2 s then 4 s apart), the same conversation continues on Qwen via
+OpenRouter, including the tool results so far. The next request tries Gemini first again.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--provider` | `gemini` | `openrouter` uses Qwen only (needs just `OPENROUTER_API_KEY`) |
+| `--model` | `gemini-2.5-flash` | Primary model id |
+| `--fallback` | `auto` | `auto`: Qwen when `OPENROUTER_API_KEY` is set; `openrouter`: always; `none`: off |
+| `--fallback-model` | `qwen/qwen3-235b-a22b-2507` | Any OpenRouter model with tool calling (`OPENROUTER_MODEL` also works) |
+
+Keys are read from the environment (or Colab secrets in the notebook), never from files in the repo.
 
 ## Differences from the original scripts
 
