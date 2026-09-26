@@ -8,13 +8,17 @@ and it produces:
 
 ```
 13MAY2025_processed/
-├── geotagged/            frame_2025-05-13_09-00-00.jpg …  (GPS + time + depth in EXIF)
+├── geotagged/            frame_2025-05-13_09-00-00.jpg …  (GPS + time + depth + benthic class in EXIF)
+├── classified/           the same frames sorted by class: corals/ macroalgae/ rubble/ sand/ seagrass/ (uncertain/)
 ├── untagged/             frames outside the GPX track or across GPS gaps
-├── frame_data.csv        filename, recording, time, lat, lon, depth_m, status
-├── frames.geojson        points, ready for QGIS / GEE
+├── frame_data.csv        filename, recording, time, lat, lon, depth_m, status, benthic_class, class_conf, prob_<class>…
+├── frames.geojson        points with depth and class, ready for QGIS / GEE
 ├── qa_track_map.png      GPX track with the frame positions coloured by depth
-└── report.json           counts, settings, time ranges
+├── qa_class_map.png      frame positions coloured by benthic class
+└── report.json           counts, settings, time ranges, class counts
 ```
+
+`classified/` and the class columns appear when a YOLO model is configured (`--yolo-model` or `OPERA_YOLO_MODEL`).
 
 ## How a request runs
 
@@ -29,16 +33,34 @@ and it produces:
    - extracts one frame per second (configurable) across all chapters as one continuous timeline;
    - names frames from the video CreateDate;
    - interpolates position and depth from the GPX and writes EXIF (GPS, DateTimeOriginal with `+08:00`, depth in ImageDescription).
+   - with a YOLO model configured, classifies every geotagged frame (see below).
 4. **`verify_geotags`** reads the EXIF back from a sample of the images and compares it with the CSV.
 
+Re-running into the same output folder first removes the previous run's outputs (only the files listed above),
+so a corrected re-run never mixes with frames from the wrong one. The output folder may not be inside the
+videos folder.
+
 Optional tools:
-- **`classify_frames`** adds the YOLO benthic class to the CSV and GeoJSON.
+- **`classify_frames`** re-classifies an existing output folder (another model or threshold) without re-extracting frames.
 - **`concatenate_recordings`** writes the merged videos.
 - **`search_workflow_docs`** answers "how does the original do X" from the sdmad-opera-fieldprocessing repo (the RAG part).
 
+## Benthic classification
+
+After geotagging, `opera_agent/classify.py` runs the YOLO11 classification model trained in
+`notebooks/YOLO_classification.ipynb` on each geotagged frame:
+
+- the frame keeps all its EXIF (GPS, DateTimeOriginal, depth). The class is added to ImageDescription by
+  rewriting only the EXIF block, so the image is not re-encoded;
+- the frame is copied to `classified/<class>/` (`--organize move` saves disk space, `none` only tags);
+- frames below `--conf` are labelled `uncertain`;
+- `frame_data.csv` and `frames.geojson` get `benthic_class`, `class_conf` and one `prob_<class>` column per class.
+
+Put the weights in `models/` (see `models/README.md`).
+
 ## Run it
 
-**Colab:** open `OpERA_FieldAgent_Colab.ipynb`.
+**Colab:** open `notebooks/OpERA_FieldAgent_Colab.ipynb`.
 
 **Command line:**
 
@@ -50,7 +72,12 @@ python -m opera_agent --chat --data-root /data/surveys
 
 # same pipeline without the LLM
 python -m opera_agent inspect /data/surveys/13MAY2025
-python -m opera_agent process /data/surveys/13MAY2025 /data/surveys/13MAY2025_processed --interval 1
+python -m opera_agent process /data/surveys/13MAY2025 /data/surveys/13MAY2025_processed --interval 1 \
+    --yolo-model models/yolo11l-benthic-cls.pt
+python -m opera_agent classify /data/surveys/13MAY2025_processed --yolo-model models/yolo11l-benthic-cls.pt --conf 0.5
+
+# agent with classification
+python -m opera_agent --yolo-model models/yolo11l-benthic-cls.pt --data-root /data/surveys "process the 13MAY2025 survey"
 ```
 
 **Settings:**
@@ -62,6 +89,20 @@ python -m opera_agent process /data/surveys/13MAY2025 /data/surveys/13MAY2025_pr
 | `--clock-offset` | 0 s | Corrects camera clock drift, in seconds |
 | `--max-gap` | 60 s | Longest GPX gap it will interpolate across |
 | `--max-width` | full resolution | Downscales frames to this width |
+| `--yolo-model` | `$OPERA_YOLO_MODEL` | YOLO classification weights; classification is skipped without one |
+| `--conf` | 0 | Frames below this top-1 confidence are labelled `uncertain` |
+
+## Repository layout
+
+```
+opera_agent/        pipeline.py (frames + geotagging), classify.py (YOLO), tools.py + agent.py (Gemini agent), CLI
+opera_rag/          search over the fieldprocessing repository (used by search_workflow_docs)
+notebooks/          OpERA_FieldAgent_Colab.ipynb (run the agent), YOLO_classification.ipynb (train the model)
+models/             YOLO weights go here (git-ignored)
+tests/              pytest; runs without ffmpeg, a GPU or ultralytics
+```
+
+Run the tests with `pip install pytest pillow && pytest`.
 
 ## Differences from the original scripts
 

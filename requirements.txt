@@ -1,7 +1,9 @@
 google-genai   # the agent (not needed for the direct pipeline)
 piexif         # write GPS EXIF (replaces the Windows exiftool.exe)
 numpy
-matplotlib     # QA track map
+matplotlib     # QA maps
+pillow
 pypdf          # repo docs search: workflow slides
 # system: ffmpeg + ffprobe (preinstalled in Colab). exiftool is optional.
-# optional: ultralytics  (classify_frames with yolo-benthic-cls.pt)
+# classification: ultralytics (pulls in torch; a GPU helps). pip install ultralytics
+# tests: pytest
