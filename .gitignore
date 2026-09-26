@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets
+.env
+
+# Generated locally: cloned repos and docs-search indexes (opera_rag / OperaAgent)
+repos/
+docs_index/
+opera_index/
+
+# Model weights and survey data/outputs are large: keep them on Drive, not in git
+models/*.pt
+*.MP4
+*.mp4
+*.MOV
+*.mov
+*_processed/
+runs/

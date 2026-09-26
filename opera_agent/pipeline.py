@@ -30,7 +30,7 @@ VIDEO_EXT = {".mp4", ".mov"}
 
 
 # =================================================================== discovery
-_GOPRO_NEW = re.compile(r"^G([HXLP])(\d{2})(\d{4})$", re.I)   # GH010123 → chapter 01, file 0123
+_GOPRO_NEW = re.compile(r"^G([HXL])(\d{2})(\d{4})$", re.I)    # GH010123 → chapter 01, file 0123
 _GOPRO_OLD_FIRST = re.compile(r"^GOPR(\d{4})$", re.I)          # GOPR0123 (chapter 0)
 _GOPRO_OLD_NEXT = re.compile(r"^GP(\d{2})(\d{4})$", re.I)      # GP010123
 
@@ -58,12 +58,13 @@ class Recording:
 
 def _gopro_key(stem: str) -> tuple[str, int]:
     """(recording id, chapter number) from a GoPro file name; non-GoPro files are their own recording."""
-    if m := _GOPRO_NEW.match(stem):
-        return f"G{m.group(1).upper()}{m.group(3)}", int(m.group(2))
+    # old-style names first: GP010123 must continue GOPR0123, not start its own recording
     if m := _GOPRO_OLD_FIRST.match(stem):
         return f"GOPR{m.group(1)}", 0
     if m := _GOPRO_OLD_NEXT.match(stem):
         return f"GOPR{m.group(2)}", int(m.group(1))
+    if m := _GOPRO_NEW.match(stem):
+        return f"G{m.group(1).upper()}{m.group(3)}", int(m.group(2))
     return stem, 0
 
 
@@ -267,6 +268,14 @@ def extract_frames(rec: Recording, out_dir: Path, interval_s: float = 1.0, clock
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_output_dir(videos_dir: str | Path, output_dir: str | Path):
+    """The output must not be the videos folder or inside it: the video search is recursive, so
+    anything written there (e.g. concatenated .mp4s) would be picked up as input on the next run."""
+    v, o = Path(videos_dir).resolve(), Path(output_dir).resolve()
+    if o == v or v in o.parents:
+        raise ValueError(f"output_dir {output_dir} must not be the videos folder or inside it ({videos_dir})")
+
+
 def concatenate_videos(rec: Recording, out_path: Path) -> Path:
     """Lossless concatenation of a recording's chapters (like scripts/concatenate_video.py)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,6 +346,27 @@ def read_gps_exif(jpg: Path) -> tuple[float, float] | None:
 
 
 # =================================================================== the whole thing
+# Everything process_survey / classify_frames write. A re-run clears these first so frames from an
+# earlier run (e.g. with the wrong time zone, hence different file names) don't linger.
+MANAGED_OUTPUTS = ("geotagged", "untagged", "classified", "_frames", "frame_data.csv", "frames.geojson",
+                   "qa_track_map.png", "qa_class_map.png", "report.json")
+
+
+def clear_outputs(out: Path, log=print):
+    removed = []
+    for name in MANAGED_OUTPUTS:
+        p = out / name
+        if p.is_dir():
+            shutil.rmtree(p)
+        elif p.exists():
+            p.unlink()
+        else:
+            continue
+        removed.append(name)
+    if removed:
+        log(f"  cleared previous outputs in {out}: {', '.join(removed)}")
+
+
 def check_overlap(recs: list[Recording], track: Track, tz: str, clock_offset_s: float = 0.0) -> list[dict]:
     """How much of each recording falls inside the GPX time range."""
     z = ZoneInfo(tz)
@@ -383,16 +413,16 @@ def inspect(videos_dir: str, gpx: str | list[str] | None = None, tz: str = LOCAL
 def process_survey(videos_dir: str, output_dir: str, gpx: str | list[str] | None = None,
                    interval_s: float = 1.0, tz: str = LOCAL_TZ, clock_offset_s: float = 0.0,
                    max_gap_s: float = 60.0, max_width: int | None = None, keep_untagged: bool = True,
-                   recordings: list[str] | None = None, log=print) -> dict:
-    """Videos folder + GPX → output_dir/geotagged/*.jpg, frame_data.csv, frames.geojson, report.json"""
-    out = Path(output_dir)
-    tagged_dir, untag_dir, work = out / "geotagged", out / "untagged", out / "_frames"
-    for d in (tagged_dir, work):
-        d.mkdir(parents=True, exist_ok=True)
-
+                   recordings: list[str] | None = None, model_path: str | None = None,
+                   classify_conf: float = 0.0, log=print) -> dict:
+    """Videos folder + GPX → output_dir/geotagged/*.jpg, frame_data.csv, frames.geojson, report.json.
+    With model_path (a YOLO classification .pt), the geotagged frames are then classified: see
+    opera_agent.classify.classify_frames."""
+    check_output_dir(videos_dir, output_dir)
     vids = find_files(videos_dir, VIDEO_EXT)
     if not vids:
         raise FileNotFoundError(f"No .mp4/.mov videos under {videos_dir}")
+
     recs = [probe_recording(r) for r in group_recordings(vids)]
     if recordings:
         recs = [r for r in recs if r.key in recordings]
@@ -401,6 +431,14 @@ def process_survey(videos_dir: str, output_dir: str, gpx: str | list[str] | None
         raise FileNotFoundError("No GPX file given or found next to the videos")
     track = merge_tracks([read_gpx(g) for g in gpx_files])
     log(f"GPX: {len(track.t)} points from {len(gpx_files)} file(s); {len(recs)} recording(s)")
+
+    # inputs are valid: only now replace the previous run's outputs
+    out = Path(output_dir)
+    if out.exists():
+        clear_outputs(out, log)
+    tagged_dir, untag_dir, work = out / "geotagged", out / "untagged", out / "_frames"
+    for d in (tagged_dir, work):
+        d.mkdir(parents=True, exist_ok=True)
 
     z = ZoneInfo(tz)
     rows = []
@@ -453,7 +491,24 @@ def process_survey(videos_dir: str, output_dir: str, gpx: str | list[str] | None
     except Exception as e:
         log(f"  (QA map skipped: {e})")
     (out / "report.json").write_text(json.dumps(report, indent=2, default=str))
+    if model_path:
+        # geotagging is done and saved; a classification problem (no ultralytics, bad weights) is reported,
+        # not raised, so the geotagged result isn't lost. classify_frames can be re-run on its own.
+        try:
+            from .classify import classify_frames
+            report["classification"] = classify_frames(out, model_path, conf=classify_conf, log=log)
+        except Exception as e:
+            log(f"  ! classification failed: {type(e).__name__}: {e}")
+            report["classification"] = {"error": f"{type(e).__name__}: {e}"}
+            (out / "report.json").write_text(json.dumps(report, indent=2, default=str))
     return report
+
+
+def _frame_rows_ok(out: Path) -> tuple[list[dict], list[dict]]:
+    """All rows of output_dir/frame_data.csv, and the geotagged ones among them."""
+    with open(Path(out) / "frame_data.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    return rows, [r for r in rows if r["status"] == "ok"]
 
 
 def _qa_plot(track: Track, rows: list[dict], path: Path) -> Path:

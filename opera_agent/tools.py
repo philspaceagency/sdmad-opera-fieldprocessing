@@ -1,8 +1,6 @@
 """Tools the agent can call. Each returns a JSON-serialisable dict."""
 from __future__ import annotations
 
-import csv
-import json
 import os
 from pathlib import Path
 
@@ -48,7 +46,10 @@ TOOLS = [
             "max_gap_s": {"type": "number", "description": "don't interpolate across GPX gaps longer than this (default 60)"},
             "max_width": {"type": "integer", "description": "downscale frames to this width in px (default: full resolution)"},
             "recordings": {"type": "array", "items": {"type": "string"},
-                           "description": "only these recording ids, e.g. ['GH0123']"}},
+                           "description": "only these recording ids, e.g. ['GH0123']"},
+            "classify": {"type": "boolean",
+                         "description": "after geotagging, classify the frames with the YOLO benthic model "
+                                        "(default true when a model is configured)"}},
             "required": ["videos_dir", "output_dir"]},
     },
     {
@@ -67,13 +68,17 @@ TOOLS = [
     },
     {
         "name": "classify_frames",
-        "description": "Optional, only when asked: classify geotagged frames with the YOLO benthic model "
-                       "(corals, macroalgae, rubble, sand, seagrass) and add class + confidence to "
-                       "frame_data.csv and frames.geojson. Needs ultralytics and ideally a GPU.",
+        "description": "Classify the geotagged frames of an existing process_survey output with the YOLO benthic "
+                       "model (corals, macroalgae, rubble, sand, seagrass). Keeps GPS/time/depth EXIF, adds the "
+                       "class to EXIF, sorts frames into classified/<class>/ and adds class + probabilities to "
+                       "frame_data.csv and frames.geojson. Use to (re)classify without re-extracting frames.",
         "parameters": {"type": "object", "properties": {
             "output_dir": {"type": "string", "description": "a folder produced by process_survey"},
-            "model_path": {"type": "string", "description": "path to yolo-benthic-cls.pt"},
-            "conf": {"type": "number"}}, "required": ["output_dir"]},
+            "model_path": {"type": "string", "description": "YOLO classification weights (.pt); default: configured model"},
+            "conf": {"type": "number", "description": "below this top-1 confidence the class is 'uncertain' (default 0)"},
+            "organize": {"type": "string", "enum": ["copy", "move", "none"],
+                         "description": "copy (default) or move frames into classified/<class>/, or none"}},
+            "required": ["output_dir"]},
     },
     {
         "name": "search_workflow_docs",
@@ -126,16 +131,15 @@ class ToolRunner:
         return P.inspect(videos_dir, gpx, tz, clock_offset_s)
 
     def t_process_survey(self, videos_dir, output_dir, gpx=None, interval_s=1.0, tz=P.LOCAL_TZ,
-                         clock_offset_s=0.0, max_gap_s=60.0, max_width=None, recordings=None):
-        if Path(output_dir).resolve() == Path(videos_dir).resolve():
-            return {"error": "output_dir must differ from videos_dir"}
+                         clock_offset_s=0.0, max_gap_s=60.0, max_width=None, recordings=None, classify=None):
+        model = self.default_model_path if classify is not False else None
+        if classify and not model:
+            return {"error": "classify=true but no YOLO model is configured (--yolo-model / OPERA_YOLO_MODEL)"}
         return P.process_survey(videos_dir, output_dir, gpx, interval_s, tz, clock_offset_s,
-                                max_gap_s, max_width, recordings=recordings, log=self.log)
+                                max_gap_s, max_width, recordings=recordings, model_path=model, log=self.log)
 
     def t_verify_geotags(self, output_dir, n=5):
-        out = Path(output_dir)
-        rows = list(csv.DictReader(open(out / "frame_data.csv")))
-        ok = [r for r in rows if r["status"] == "ok"]
+        _, ok = P._frame_rows_ok(Path(output_dir))
         if not ok:
             return {"error": "no geotagged frames in frame_data.csv"}
         step = max(1, len(ok) // n)
@@ -148,6 +152,7 @@ class ToolRunner:
         return {"checked": len(checks), "all_have_gps": all(c["exif"] for c in checks), "samples": checks}
 
     def t_concatenate_recordings(self, videos_dir, output_dir):
+        P.check_output_dir(videos_dir, output_dir)
         recs = P.group_recordings(P.find_files(videos_dir, P.VIDEO_EXT))
         made = []
         for r in recs:
@@ -156,36 +161,12 @@ class ToolRunner:
             made.append(str(P.concatenate_videos(r, Path(output_dir) / f"{r.key}_concat.mp4")))
         return {"concatenated": made, "single_chapter_recordings_skipped": [r.key for r in recs if len(r.chapters) == 1]}
 
-    def t_classify_frames(self, output_dir, model_path=None, conf=0.0):
-        from ultralytics import YOLO
+    def t_classify_frames(self, output_dir, model_path=None, conf=0.0, organize="copy"):
+        from .classify import classify_frames
         model_path = model_path or self.default_model_path
-        if not model_path or not Path(model_path).exists():
-            return {"error": "model_path not found; pass the path to yolo-benthic-cls.pt"}
-        out = Path(output_dir)
-        rows = list(csv.DictReader(open(out / "frame_data.csv")))
-        ok = [r for r in rows if r["status"] == "ok"]
-        model = YOLO(model_path)
-        by_name = {}
-        for r in ok:
-            res = model.predict(r["path"], imgsz=640, verbose=False)[0]
-            cls, p = res.names[int(res.probs.top1)], float(res.probs.top1conf)
-            by_name[r["frame_filename"]] = (cls, p) if p >= conf else ("uncertain", p)
-        for r in rows:
-            r["benthic_class"], r["class_conf"] = by_name.get(r["frame_filename"], ("", ""))
-            if r["class_conf"] != "":
-                r["class_conf"] = round(r["class_conf"], 3)
-        with open(out / "frame_data.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
-        gj = json.loads((out / "frames.geojson").read_text())
-        for feat in gj["features"]:
-            c = by_name.get(feat["properties"]["frame_filename"])
-            if c:
-                feat["properties"]["benthic_class"], feat["properties"]["class_conf"] = c[0], round(c[1], 3)
-        (out / "frames.geojson").write_text(json.dumps(gj))
-        counts = {}
-        for c, _ in by_name.values():
-            counts[c] = counts.get(c, 0) + 1
-        return {"classified": len(by_name), "class_counts": counts}
+        if not model_path:
+            return {"error": "no YOLO model configured; pass model_path (the classification .pt)"}
+        return classify_frames(output_dir, model_path, conf=conf, organize=organize, log=self.log)
 
     def t_search_workflow_docs(self, query, k=5):
         if self.rag is None:

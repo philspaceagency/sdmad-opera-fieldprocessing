@@ -30,7 +30,10 @@ How to work:
 4. After processing, run verify_geotags, then report briefly: output folder, frames geotagged vs total, untagged
    frames and why (before/after the track, GPS gaps), and the files (geotagged/, frame_data.csv, frames.geojson,
    qa_track_map.png).
-5. Classification and video concatenation are optional. Do them only when asked.
+5. Classification: when a YOLO model is configured, process_survey classifies the geotagged frames right after
+   geotagging (classify=false only if the user says not to). Report the class counts and classified/<class>/,
+   qa_class_map.png. To (re)classify an existing output without re-extracting, use classify_frames.
+   Video concatenation is optional: only when asked.
 6. For questions about the original method, use search_workflow_docs and cite the file it came from.
 Be concise. Give exact paths and numbers. Never invent paths or results."""
 
@@ -42,6 +45,7 @@ class OperaAgent:
         from google import genai
         self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
         self.llm_model, self.data_root, self.verbose, self.max_steps = llm_model, data_root, verbose, max_steps
+        model_path = model_path or os.environ.get("OPERA_YOLO_MODEL")
         if rag is None:
             rag = self._load_docs(docs_index)
         self.tools = ToolRunner(rag=rag, default_model_path=model_path, log=self._log)
@@ -73,6 +77,8 @@ class OperaAgent:
         from google.genai import types
 
         system = SYSTEM + (f"\nData root (search here first): {self.data_root}" if self.data_root else "")
+        system += ("\nYOLO model configured: classification runs after geotagging." if self.tools.default_model_path
+                   else "\nNo YOLO model configured: classification is unavailable unless the user gives model_path.")
         config = types.GenerateContentConfig(system_instruction=system, max_output_tokens=4000,
                                              tools=[types.Tool(function_declarations=TOOLS)])
         self.messages.append(types.Content(role="user", parts=[types.Part(text=request)]))
