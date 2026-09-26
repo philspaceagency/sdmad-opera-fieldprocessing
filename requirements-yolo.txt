@@ -1,0 +1,3 @@
+# Benthic classification (opera_agent/classify.py, --yolo-model). Pulls in PyTorch; a GPU helps.
+-r requirements.txt
+ultralytics

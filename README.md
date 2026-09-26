@@ -66,6 +66,7 @@ Put the weights in `models/` (see `models/README.md`).
 
 ```bash
 pip install -r requirements.txt          # plus ffmpeg on the PATH
+pip install -r requirements-yolo.txt     # only for benthic classification (adds ultralytics + PyTorch)
 export GEMINI_API_KEY=...
 python -m opera_agent --data-root /data/surveys "process the 13MAY2025 survey"
 python -m opera_agent --chat --data-root /data/surveys

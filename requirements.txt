@@ -5,5 +5,5 @@ matplotlib     # QA maps
 pillow
 pypdf          # repo docs search: workflow slides
 # system: ffmpeg + ffprobe (preinstalled in Colab). exiftool is optional.
-# classification: ultralytics (pulls in torch; a GPU helps). pip install ultralytics
+# classification: pip install -r requirements-yolo.txt (adds ultralytics + PyTorch)
 # tests: pytest
