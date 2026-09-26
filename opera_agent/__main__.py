@@ -1,8 +1,9 @@
 """Command line.
 
-  # talk to it (needs GEMINI_API_KEY)
+  # talk to it (needs GEMINI_API_KEY; with OPENROUTER_API_KEY set it falls back to Qwen when Gemini is busy)
   python -m opera_agent "process the GoPro videos in /data/13MAY2025 with the GPX in /data/GPX"
   python -m opera_agent --chat --data-root /data
+  python -m opera_agent --provider openrouter --chat --data-root /data      # Qwen only
 
   # or run the pipeline directly, no LLM involved
   python -m opera_agent inspect /data/13MAY2025/DCIM --gpx /data/13MAY2025/GPX/13MAY2025.GPX
@@ -61,11 +62,18 @@ def main():
     p.add_argument("request", nargs="?")
     p.add_argument("--chat", action="store_true")
     p.add_argument("--data-root")
-    p.add_argument("--model", default="gemini-2.5-flash")
+    p.add_argument("--provider", choices=["gemini", "openrouter"], default="gemini",
+                   help="gemini (GEMINI_API_KEY) or openrouter (Qwen, OPENROUTER_API_KEY)")
+    p.add_argument("--model", help="model id (default gemini-2.5-flash, or the Qwen model for openrouter)")
+    p.add_argument("--fallback", choices=["auto", "openrouter", "none"], default="auto",
+                   help="when Gemini stays busy, continue on Qwen via OpenRouter "
+                        "(auto: if OPENROUTER_API_KEY is set)")
+    p.add_argument("--fallback-model", help="OpenRouter model for the fallback (default qwen/qwen3-235b-a22b-2507)")
     p.add_argument("--yolo-model", help="path to yolo-benthic-cls.pt (for classification)")
     a = p.parse_args()
     from .agent import OperaAgent
-    agent = OperaAgent(data_root=a.data_root, llm_model=a.model, model_path=a.yolo_model)
+    agent = OperaAgent(data_root=a.data_root, llm_model=a.model, model_path=a.yolo_model, provider=a.provider,
+                       fallback=None if a.fallback == "none" else a.fallback, fallback_model=a.fallback_model)
     if a.chat or not a.request:
         agent.chat()
     else:
