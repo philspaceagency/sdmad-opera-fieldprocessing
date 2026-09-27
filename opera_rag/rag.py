@@ -10,7 +10,7 @@ from .loaders import Chunk, load_repo, repo_map, resolve_repo
 
 DEFAULT_REPOS = ["https://github.com/philspaceagency/sdmad-opera-fieldprocessing.git"]
 DEFAULT_EMBED = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLM = "gemini-2.5-flash"
+DEFAULT_LLM = "gemini-3.5-flash"
 
 SYSTEM_PROMPT = """You are a code assistant for PhilSA's OpERA field-processing tooling \
 (underwater benthic GoPro video → frames → GPX/echosounder geotagging → YOLO benthic classification).
