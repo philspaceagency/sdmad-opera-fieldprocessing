@@ -9,7 +9,7 @@ import os
 import time
 from pathlib import Path
 
-from .llm import DEFAULT_GEMINI as DEFAULT_LLM, TransientLLMError, make_backend
+from .llm import DEFAULT_GEMINI as DEFAULT_LLM, GEMINI_FALLBACKS, ModelUnavailableError, TransientLLMError, make_backend
 from .tools import TOOLS, ToolRunner
 
 FIELD_REPO = "https://github.com/philspaceagency/sdmad-opera-fieldprocessing.git"
@@ -41,28 +41,36 @@ Be concise. Give exact paths and numbers. Never invent paths or results."""
 
 class OperaAgent:
     """provider: "gemini" (default) or "openrouter" (Qwen via OpenRouter, key in OPENROUTER_API_KEY).
-    fallback: when the primary model stays busy (rate limit / overload / network) after `retries`, the same
-    conversation continues on the fallback. "auto" = Qwen on OpenRouter if OPENROUTER_API_KEY is set,
-    "openrouter" = always, None = no fallback. Each new request tries the primary model first again."""
+    When the active model stays busy (rate limit / overload / network) after `retries`, or doesn't exist for
+    this key (404), the same conversation continues on the next model in the chain:
+      primary → gemini_fallbacks (default gemini-3.5-flash-lite) → Qwen on OpenRouter.
+    fallback: "auto" = add Qwen if OPENROUTER_API_KEY is set, "openrouter" = always, None = no Qwen.
+    Each new request tries the primary model first again."""
 
     def __init__(self, data_root: str | None = None, llm_model: str | None = None, api_key: str | None = None,
                  rag=None, docs_index: str | None = None, model_path: str | None = None,
                  verbose: bool = True, max_steps: int = 25, provider: str = "gemini",
                  fallback: str | None = "auto", fallback_model: str | None = None, retries: int = 2,
-                 backend=None, fallback_backend=None):
+                 gemini_fallbacks: list[str] | None = None, backend=None, fallback_backends: list | None = None):
         self.data_root, self.verbose, self.max_steps, self.retries = data_root, verbose, max_steps, retries
         self.backend = backend or make_backend(provider, llm_model, api_key)
-        if fallback_backend is None and fallback and provider != "openrouter":
-            if fallback == "openrouter" or os.environ.get("OPENROUTER_API_KEY"):
-                fallback_backend = make_backend("openrouter", fallback_model)
-        self.fallback = fallback_backend
+        if fallback_backends is None:
+            fallback_backends = []
+            if provider == "gemini":
+                for m in GEMINI_FALLBACKS if gemini_fallbacks is None else gemini_fallbacks:
+                    if m != self.backend.model:
+                        fallback_backends.append(make_backend("gemini", m, api_key))
+                if fallback and (fallback == "openrouter" or os.environ.get("OPENROUTER_API_KEY")):
+                    fallback_backends.append(make_backend("openrouter", fallback_model))
+        self.fallbacks = list(fallback_backends)
         self._sleep = time.sleep
         model_path = model_path or os.environ.get("OPERA_YOLO_MODEL")
         if rag is None:
             rag = self._load_docs(docs_index)
         self.tools = ToolRunner(rag=rag, default_model_path=model_path, log=self._log)
         self.messages: list[dict] = []   # provider-neutral history (see llm.py)
-        self._log(f"LLM: {self.backend.name}" + (f" (fallback: {self.fallback.name})" if self.fallback else ""))
+        self._log(f"LLM: {self.backend.name}"
+                  + (f" (fallback: {' → '.join(b.name for b in self.fallbacks)})" if self.fallbacks else ""))
 
     # -------------------------------------------------------------- docs (RAG)
     @staticmethod
@@ -86,13 +94,17 @@ class OperaAgent:
     # -------------------------------------------------------------- main loop
     def _complete(self, system: str) -> dict:
         """Ask the active model; on a transient error retry with backoff, then move to the fallback."""
-        chain = [self.backend] + ([self.fallback] if self.fallback else [])
+        chain = [self.backend] + self.fallbacks
         err = None
         for i in range(self._active, len(chain)):
             b = chain[i]
             for attempt in range(self.retries + 1):
                 try:
                     return b.complete(system, self.messages, TOOLS)
+                except ModelUnavailableError as e:
+                    err = e
+                    self._log(f"  {b.name} is not available for this API key ({str(e)[:160]})")
+                    break
                 except TransientLLMError as e:
                     err = e
                     if attempt < self.retries:
@@ -100,7 +112,7 @@ class OperaAgent:
                         self._log(f"  {b.name} unavailable ({str(e)[:120]}); retrying in {wait}s")
                         self._sleep(wait)
             if i + 1 < len(chain):
-                self._log(f"  {b.name} still unavailable → switching to {chain[i + 1].name}")
+                self._log(f"  {b.name} unavailable → switching to {chain[i + 1].name}")
                 self._active = i + 1
         raise err
 

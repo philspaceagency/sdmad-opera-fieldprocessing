@@ -108,14 +108,20 @@ Run the tests with `pip install pytest pillow && pytest`.
 
 ## Language model: Gemini with a Qwen fallback
 
-The agent uses Gemini by default. If `OPENROUTER_API_KEY` is set and Gemini keeps returning rate-limit,
-overload or network errors (after 2 retries, 2 s then 4 s apart), the same conversation continues on Qwen via
-OpenRouter, including the tool results so far. The next request tries Gemini first again.
+The agent uses Gemini 3.5 Flash by default. When a model keeps returning rate-limit, overload or network
+errors (after 2 retries, 2 s then 4 s apart), or is not available for your key (404, e.g. a retired model), the
+same conversation continues on the next model, including the tool results so far:
+
+`gemini-3.5-flash` → `gemini-3.5-flash-lite` → Qwen via OpenRouter (only when `OPENROUTER_API_KEY` is set)
+
+The next request tries the first model again. To use Gemini 3.1 Pro: `--model gemini-3.1-pro`
+(or `GEMINI_MODEL=gemini-3.1-pro`). To see which ids your key can use: `client.models.list()`.
 
 | Option | Default | What it does |
 |---|---|---|
 | `--provider` | `gemini` | `openrouter` uses Qwen only (needs just `OPENROUTER_API_KEY`) |
-| `--model` | `gemini-2.5-flash` | Primary model id |
+| `--model` | `gemini-3.5-flash` | Primary model id (`GEMINI_MODEL` also works) |
+| `--gemini-fallback` | `gemini-3.5-flash-lite` | Gemini model(s) tried before Qwen; repeatable, `none` to skip |
 | `--fallback` | `auto` | `auto`: Qwen when `OPENROUTER_API_KEY` is set; `openrouter`: always; `none`: off |
 | `--fallback-model` | `qwen/qwen3-235b-a22b-2507` | Any OpenRouter model with tool calling (`OPENROUTER_MODEL` also works) |
 

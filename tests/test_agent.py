@@ -31,7 +31,7 @@ def answer(text):
 
 
 def agent(primary, fallback=None, **kw):
-    a = OperaAgent(backend=primary, fallback_backend=fallback, rag=False, verbose=False, **kw)
+    a = OperaAgent(backend=primary, fallback_backends=[fallback] if fallback else [], rag=False, verbose=False, **kw)
     a._sleep = lambda s: None
     return a
 
@@ -139,3 +139,35 @@ def test_gemini_history_conversion():
     assert c[2].parts[0].function_response.response == {"result": {"x": 1}}
     assert c[3].parts[1].function_call.args == {"p": 2}
     assert len(c[4].parts) == 2                                   # consecutive tool results grouped
+
+
+# ---------------------------------------------------------------- model chain
+class Retired(Scripted):
+    def complete(self, system, messages, tools, max_tokens=4000):
+        self.seen.append(None)
+        raise llm.ModelUnavailableError(f"{self.name}: 404 NOT_FOUND model is no longer available")
+
+
+def test_retired_model_is_skipped_without_retries():
+    old = Retired("gemini-2.5-flash")
+    lite = Scripted("gemini-3.5-flash-lite", fail=1, replies=[answer("lite answered")])
+    q = Scripted("qwen", [answer("qwen")])
+    a = OperaAgent(backend=old, fallback_backends=[lite, q], rag=False, verbose=False, retries=2)
+    a._sleep = lambda s: None
+    assert a.run("hi") == "lite answered"
+    assert len(old.seen) == 1 and q.seen == []            # 404: no retries, straight to the next model
+
+
+def test_default_chain(monkeypatch):
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "o")
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    a = OperaAgent(rag=False, verbose=False)
+    assert [a.backend.name] + [b.name for b in a.fallbacks] == [
+        "gemini:gemini-3.5-flash", "gemini:gemini-3.5-flash-lite", f"openrouter:{llm.DEFAULT_QWEN}"]
+    a = OperaAgent(rag=False, verbose=False, llm_model="gemini-3.1-pro", gemini_fallbacks=[], fallback=None)
+    assert a.backend.name == "gemini:gemini-3.1-pro" and a.fallbacks == []
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    a = OperaAgent(rag=False, verbose=False, llm_model="gemini-3.5-flash-lite")
+    assert a.fallbacks == []                              # the lite fallback isn't added twice

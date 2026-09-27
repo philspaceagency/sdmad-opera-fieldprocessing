@@ -64,7 +64,10 @@ def main():
     p.add_argument("--data-root")
     p.add_argument("--provider", choices=["gemini", "openrouter"], default="gemini",
                    help="gemini (GEMINI_API_KEY) or openrouter (Qwen, OPENROUTER_API_KEY)")
-    p.add_argument("--model", help="model id (default gemini-2.5-flash, or the Qwen model for openrouter)")
+    p.add_argument("--model", help="model id (default gemini-3.5-flash, or the Qwen model for openrouter); "
+                                   "e.g. gemini-3.5-flash-lite, gemini-3.1-pro")
+    p.add_argument("--gemini-fallback", action="append",
+                   help="Gemini model(s) to try before Qwen (default gemini-3.5-flash-lite; 'none' to skip)")
     p.add_argument("--fallback", choices=["auto", "openrouter", "none"], default="auto",
                    help="when Gemini stays busy, continue on Qwen via OpenRouter "
                         "(auto: if OPENROUTER_API_KEY is set)")
@@ -73,7 +76,9 @@ def main():
     a = p.parse_args()
     from .agent import OperaAgent
     agent = OperaAgent(data_root=a.data_root, llm_model=a.model, model_path=a.yolo_model, provider=a.provider,
-                       fallback=None if a.fallback == "none" else a.fallback, fallback_model=a.fallback_model)
+                       fallback=None if a.fallback == "none" else a.fallback, fallback_model=a.fallback_model,
+                       gemini_fallbacks=None if not a.gemini_fallback else
+                       [m for m in a.gemini_fallback if m != "none"])
     if a.chat or not a.request:
         agent.chat()
     else:

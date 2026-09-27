@@ -13,7 +13,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-DEFAULT_GEMINI = "gemini-2.5-flash"
+DEFAULT_GEMINI = "gemini-3.5-flash"
+GEMINI_FALLBACKS = ["gemini-3.5-flash-lite"]        # tried before leaving Gemini; "gemini-3.1-pro" also works
 DEFAULT_QWEN = "qwen/qwen3-235b-a22b-2507"
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
@@ -22,6 +23,10 @@ TRANSIENT_CODES = {408, 429, 500, 502, 503, 504, 529}
 
 class TransientLLMError(RuntimeError):
     """Rate limit, overload or network trouble: worth a retry, or a switch to the fallback model."""
+
+
+class ModelUnavailableError(TransientLLMError):
+    """The model id doesn't exist (anymore) for this key: no point retrying, go straight to the next model."""
 
 
 # ---------------------------------------------------------------- Gemini
@@ -63,7 +68,10 @@ class GeminiBackend:
             resp = self.client.models.generate_content(model=self.model, contents=self._contents(messages),
                                                        config=config)
         except Exception as e:
-            if getattr(e, "code", None) in TRANSIENT_CODES or isinstance(e, (ConnectionError, TimeoutError)):
+            code = getattr(e, "code", None)
+            if code == 404:                         # retired / unknown model, e.g. gemini-2.5-flash for new users
+                raise ModelUnavailableError(f"{self.name}: {e}") from e
+            if code in TRANSIENT_CODES or isinstance(e, (ConnectionError, TimeoutError)):
                 raise TransientLLMError(f"{self.name}: {e}") from e
             raise
         cand = resp.candidates[0] if resp.candidates else None
@@ -115,6 +123,8 @@ class OpenAICompatBackend:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")[:500]
+            if e.code == 404:
+                raise ModelUnavailableError(f"{self.name}: HTTP 404 {body}") from e
             if e.code in TRANSIENT_CODES:
                 raise TransientLLMError(f"{self.name}: HTTP {e.code} {body}") from e
             raise RuntimeError(f"{self.name}: HTTP {e.code} {body}") from e
@@ -144,7 +154,7 @@ class OpenAICompatBackend:
 
 def make_backend(provider: str, model: str | None = None, api_key: str | None = None):
     if provider == "gemini":
-        return GeminiBackend(model or DEFAULT_GEMINI, api_key)
+        return GeminiBackend(model or os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI, api_key)
     if provider == "openrouter":
         return OpenAICompatBackend(model or os.environ.get("OPENROUTER_MODEL") or DEFAULT_QWEN, api_key)
     raise ValueError(f"unknown provider {provider!r} (gemini | openrouter)")
