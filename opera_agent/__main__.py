@@ -10,6 +10,7 @@
   python -m opera_agent process /data/13MAY2025/DCIM /data/13MAY2025_processed --gpx /data/13MAY2025/GPX/13MAY2025.GPX \
       --yolo-model models/yolo11l-benthic-cls.pt          # optional: classify after geotagging
   python -m opera_agent classify /data/13MAY2025_processed --yolo-model models/yolo11l-benthic-cls.pt
+  python -m opera_agent classify-images /data/frames /data/frames_classified --yolo-model models/yolo11l-benthic-cls.pt
 """
 import argparse
 import json
@@ -20,17 +21,29 @@ from . import pipeline as P
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "classify":
-        p = argparse.ArgumentParser(prog="opera_agent classify")
-        p.add_argument("cmd"); p.add_argument("output_dir", help="a folder produced by process")
+    if len(sys.argv) > 1 and sys.argv[1] in ("classify", "classify-images"):
+        images = sys.argv[1] == "classify-images"
+        p = argparse.ArgumentParser(prog=f"opera_agent {sys.argv[1]}")
+        p.add_argument("cmd")
+        if images:
+            p.add_argument("input_dir", help="folder of images (sub-folders are kept)")
+            p.add_argument("output_dir")
+        else:
+            p.add_argument("output_dir", help="a folder produced by process")
+            p.add_argument("--organize", choices=["copy", "move", "none"], default="copy")
         p.add_argument("--yolo-model", default=os.environ.get("OPERA_YOLO_MODEL"), help="classification .pt")
         p.add_argument("--conf", type=float, default=0.0)
-        p.add_argument("--organize", choices=["copy", "move", "none"], default="copy")
+        p.add_argument("--no-annotate", action="store_true", help="don't draw the class probabilities on the images")
         a = p.parse_args()
         if not a.yolo_model:
-            p.error("classify needs --yolo-model (or OPERA_YOLO_MODEL)")
-        from .classify import classify_frames
-        print(json.dumps(classify_frames(a.output_dir, a.yolo_model, conf=a.conf, organize=a.organize), indent=2))
+            p.error(f"{a.cmd} needs --yolo-model (or OPERA_YOLO_MODEL)")
+        from .classify import classify_frames, classify_images
+        if images:
+            res = classify_images(a.input_dir, a.output_dir, a.yolo_model, conf=a.conf, annotate=not a.no_annotate)
+        else:
+            res = classify_frames(a.output_dir, a.yolo_model, conf=a.conf, organize=a.organize,
+                                  annotate=not a.no_annotate)
+        print(json.dumps(res, indent=2))
         return
 
     if len(sys.argv) > 1 and sys.argv[1] in ("inspect", "process"):
