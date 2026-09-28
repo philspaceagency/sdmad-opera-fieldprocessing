@@ -9,7 +9,7 @@ and it produces:
 ```
 13MAY2025_processed/
 ├── geotagged/            frame_2025-05-13_09-00-00.jpg …  (GPS + time + depth + benthic class in EXIF)
-├── classified/           the same frames sorted by class: corals/ macroalgae/ rubble/ sand/ seagrass/ (uncertain/)
+├── classified/           per-class folders: seagrass/seagrass_frame_….jpg … (class probabilities drawn on each image)
 ├── untagged/             frames outside the GPX track or across GPS gaps
 ├── frame_data.csv        filename, recording, time, lat, lon, depth_m, status, benthic_class, class_conf, prob_<class>…
 ├── frames.geojson        points with depth and class, ready for QGIS / GEE
@@ -50,13 +50,21 @@ Optional tools:
 After geotagging, `opera_agent/classify.py` runs the YOLO11 classification model trained in
 `notebooks/YOLO_classification.ipynb` on each geotagged frame:
 
-- the frame keeps all its EXIF (GPS, DateTimeOriginal, depth). The class is added to ImageDescription by
-  rewriting only the EXIF block, so the image is not re-encoded;
-- the frame is copied to `classified/<class>/` (`--organize move` saves disk space, `none` only tags);
+- the geotagged frame keeps all its EXIF (GPS, DateTimeOriginal, depth). The class and the probability of every
+  class are added to ImageDescription by rewriting only the EXIF block, so the image is not re-encoded;
+- a classified copy is written to `classified/<class>/<class>_<frame>.jpg`, e.g.
+  `classified/seagrass/seagrass_frame_2025-05-13_09-00-00.jpg`, with a panel showing every class's probability
+  drawn on the image and the same EXIF (`--no-annotate` skips the panel; `--organize move` removes the
+  geotagged frame afterwards to save disk space, `none` only tags);
 - frames below `--conf` are labelled `uncertain`;
 - `frame_data.csv` and `frames.geojson` get `benthic_class`, `class_conf` and one `prob_<class>` column per class.
 
 Put the weights in `models/` (see `models/README.md`).
+
+To classify any folder of images (e.g. frames geotagged earlier), use `notebooks/YOLO_inference.ipynb` or
+`python -m opera_agent classify-images <input_dir> <output_dir> --yolo-model …`. The output has the same
+class-named, annotated images and keeps the input's sub-folders: `input/dive1/frame_x.jpg` →
+`output/dive1/seagrass/seagrass_frame_x.jpg`, plus `summary.csv` and `classification_results.json`.
 
 ## Run it
 
@@ -99,7 +107,8 @@ python -m opera_agent --yolo-model models/yolo11l-benthic-cls.pt --data-root /da
 ```
 opera_agent/        pipeline.py (frames + geotagging), classify.py (YOLO), tools.py + agent.py (Gemini agent), CLI
 opera_rag/          search over the fieldprocessing repository (used by search_workflow_docs)
-notebooks/          OpERA_FieldAgent_Colab.ipynb (run the agent), YOLO_classification.ipynb (train the model)
+notebooks/          OpERA_FieldAgent_Colab.ipynb (run the agent), YOLO_classification.ipynb (train the model),
+                    YOLO_inference.ipynb (classify a folder of images)
 models/             YOLO weights go here (git-ignored)
 tests/              pytest; runs without ffmpeg, a GPU or ultralytics
 ```

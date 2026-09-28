@@ -1,12 +1,16 @@
-"""YOLO benthic classification of the geotagged frames (step after process_survey).
+"""YOLO benthic classification.
 
-Reads output_dir/frame_data.csv, classifies every geotagged frame with a YOLO classification
-model (e.g. the yolo11l-cls model trained in notebooks/YOLO_classification.ipynb) and writes:
-  * the class into each JPG's EXIF ImageDescription. Only the EXIF block is rewritten, the image
-    is not re-encoded, so GPS, DateTimeOriginal and depth stay exactly as geotagging wrote them;
-  * classified/<class>/frame_*.jpg: the same frames sorted by class (copy by default);
+classify_frames(): the step after process_survey. Reads output_dir/frame_data.csv, classifies every geotagged
+frame with a YOLO classification model (e.g. the yolo11l-cls model trained in notebooks/YOLO_classification.ipynb)
+and writes:
+  * the class and class probabilities into each geotagged JPG's EXIF ImageDescription. Only the EXIF block is
+    rewritten, the image is not re-encoded, so GPS, DateTimeOriginal and depth stay exactly as geotagging wrote them;
+  * classified/<class>/<class>_frame_*.jpg: the frames sorted into one folder per class, named after their
+    class, with the probability of every class drawn on the image and all EXIF (GPS, time, depth) kept;
   * benthic_class, class_conf, prob_<class> ... columns in frame_data.csv and frames.geojson;
   * qa_class_map.png and a "classification" section in report.json.
+
+classify_images(): the same for any folder of images (notebooks/YOLO_inference.ipynb), keeping its sub-folders.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from .pipeline import _frame_rows_ok
 
 UNCERTAIN = "uncertain"
 _CLASS_NOTE = "; benthic class "
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
 def load_model(model_path: str | Path, device: str | None = None):
@@ -52,24 +57,118 @@ def predict(model, paths: list[str], imgsz: int = 640, batch: int = 16, device: 
     return names or [], np.array(probs)
 
 
-def write_class_exif(jpg: Path, cls: str, conf: float):
-    """Append (or replace) the benthic class in ImageDescription, keeping all other EXIF."""
+def prob_text(names: list[str], p) -> str:
+    """'seagrass 0.951, sand 0.030, ...' (highest first)."""
+    return ", ".join(f"{n} {float(v):.3f}" for n, v in sorted(zip(names, p), key=lambda t: -t[1]))
+
+
+def _load_exif(path: Path) -> dict:
     import piexif
-    exif = piexif.load(str(jpg))
+    try:
+        return piexif.load(str(path))
+    except Exception:                               # PNG, or no EXIF at all
+        return {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+
+def _with_class(exif: dict, cls: str, conf: float, probs: str = "") -> dict:
+    """Append (or replace) the benthic class + probabilities in ImageDescription, keeping all other EXIF."""
+    import piexif
     desc = exif["0th"].get(piexif.ImageIFD.ImageDescription, b"").decode("utf-8", "replace")
-    desc = desc.split(_CLASS_NOTE)[0] + f"{_CLASS_NOTE}{cls} ({conf:.2f})"
+    desc = desc.split(_CLASS_NOTE)[0] + f"{_CLASS_NOTE}{cls} ({conf:.2f})" + (f"; probabilities: {probs}" if probs else "")
     exif["0th"][piexif.ImageIFD.ImageDescription] = desc.encode()
-    piexif.insert(piexif.dump(exif), str(jpg))
+    return exif
+
+
+def write_class_exif(jpg: Path, cls: str, conf: float, probs: str = ""):
+    """Tag a JPG in place with its class; only the EXIF block is rewritten (no re-encoding)."""
+    import piexif
+    piexif.insert(piexif.dump(_with_class(piexif.load(str(jpg)), cls, conf, probs)), str(jpg))
+
+
+def classified_name(cls: str, src: Path) -> str:
+    """seagrass_frame_2025-05-13_09-00-00.jpg: the class first, the original name (time) kept for traceability."""
+    return f"{cls}_{src.stem}.jpg"
+
+
+def _font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    for name in (("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Arial Bold.ttf") if bold
+                 else ("DejaVuSans.ttf", "LiberationSans-Regular.ttf", "Arial.ttf")):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    try:
+        return ImageFont.load_default(size)         # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def draw_probabilities(img, label: str, names: list[str], p):
+    """Draw a panel (top-left) with the predicted class and a bar + percentage for every class."""
+    from PIL import Image, ImageDraw
+    img = img.convert("RGB")
+    w, h = img.size
+    size = max(12, int(min(w, h) / 32))
+    big, small = _font(int(size * 1.25), bold=True), _font(size)
+    order = sorted(zip(names, (float(v) for v in p)), key=lambda t: -t[1])
+    top_name, top_p = order[0]
+    title = f"{label.upper()} {top_p:.1%}" if label != UNCERTAIN else f"UNCERTAIN (top: {top_name} {top_p:.1%})"
+    pad, line = size // 2, int(size * 1.45)
+    name_w = max(ImageDraw.Draw(img).textlength(n, font=small) for n in names)
+    bar_w = max(size * 6, int(w * 0.12))
+    panel_w = max(int(ImageDraw.Draw(img).textlength(title, font=big)), int(name_w + bar_w + size * 4.5)) + 2 * pad
+    panel_h = pad * 2 + int(size * 1.9) + line * len(order)
+    overlay = img.copy()
+    d = ImageDraw.Draw(overlay)
+    d.rectangle([0, 0, panel_w, panel_h], fill=(0, 0, 0))
+    img = Image.blend(img, overlay, 0.6)               # 60 % black panel, the frame stays visible behind it
+    d = ImageDraw.Draw(img)
+    d.text((pad, pad), title, font=big, fill=(255, 255, 255))
+    y = pad + int(size * 1.9)
+    for n, v in order:
+        hi = n == top_name and label != UNCERTAIN
+        colour = (80, 220, 120) if hi else (200, 200, 200)
+        d.text((pad, y), n, font=small, fill=colour)
+        x0 = pad + name_w + size // 2
+        d.rectangle([x0, y + size * 0.2, x0 + bar_w, y + size * 0.9], outline=(120, 120, 120))
+        d.rectangle([x0, y + size * 0.2, x0 + max(1, int(bar_w * v)), y + size * 0.9], fill=colour)
+        d.text((x0 + bar_w + size // 2, y), f"{v:.1%}", font=small, fill=colour)
+        y += line
+    return img
+
+
+def write_classified(src: Path, dest: Path, label: str, conf: float, names: list[str], p,
+                     annotate: bool = True) -> Path:
+    """Write the classified copy of `src` to `dest`: probabilities drawn on the image (annotate=True) and all of
+    src's EXIF (GPS, time, depth) kept, plus the class and probabilities in ImageDescription."""
+    import piexif
+    from PIL import Image
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    exif = _with_class(_load_exif(src), label, conf, prob_text(names, p))
+    exif["thumbnail"], exif["1st"] = None, {}      # the old thumbnail wouldn't show the panel
+    with Image.open(src) as im:
+        out = draw_probabilities(im, label, names, p) if annotate else im.convert("RGB")
+        out.save(dest, "JPEG", quality=95, exif=piexif.dump(exif))
+    return dest
+
+
+def _label(names: list[str], p, conf: float) -> tuple[str, float]:
+    top = int(np.argmax(p))
+    c = float(p[top])
+    return (names[top] if c >= conf else UNCERTAIN), c
 
 
 def classify_frames(output_dir: str | Path, model_path: str | Path | None = None, model=None,
                     conf: float = 0.0, imgsz: int = 640, batch: int = 16, device: str | None = None,
-                    organize: str = "copy", log=print) -> dict:
+                    organize: str = "copy", annotate: bool = True, log=print) -> dict:
     """Classify the geotagged frames of a process_survey output folder.
 
     conf: frames whose top-1 confidence is below this are labelled 'uncertain'.
-    organize: 'copy' (default) copies each frame to classified/<class>/, 'move' moves it there
-    (saves disk; the CSV path column follows it), 'none' only tags EXIF and the tables.
+    organize: 'copy' (default) writes classified/<class>/<class>_<frame>.jpg next to the untouched geotagged
+    frame, 'move' removes the geotagged frame afterwards (saves disk; the CSV path column follows it),
+    'none' only tags EXIF and the tables.
+    annotate: draw the class probabilities on the classified copies (EXIF is kept either way).
     """
     if organize not in ("copy", "move", "none"):
         raise ValueError("organize must be 'copy', 'move' or 'none'")
@@ -96,19 +195,14 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
     names, probs = predict(model, [r["path"] for r in ok], imgsz, batch, device)
     counts: dict[str, int] = {}
     for r, p in zip(ok, probs):
-        top = int(np.argmax(p))
-        cls, c = names[top], float(p[top])
-        label = cls if c >= conf else UNCERTAIN
+        label, c = _label(names, p, conf)
         src = Path(r["path"])
-        write_class_exif(src, label, c)
+        write_class_exif(src, label, c, prob_text(names, p))
         dest = ""
         if organize != "none":
-            (class_dir / label).mkdir(parents=True, exist_ok=True)
-            dest = class_dir / label / src.name
-            if organize == "copy":
-                shutil.copy2(src, dest)
-            else:
-                shutil.move(str(src), dest)
+            dest = write_classified(src, class_dir / label / classified_name(label, src), label, c, names, p, annotate)
+            if organize == "move":
+                src.unlink()
                 r["path"] = str(dest)
         r["benthic_class"], r["class_conf"] = label, round(c, 4)
         r["classified_path"] = str(dest)
@@ -144,6 +238,60 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
         rep["classification"] = summary
         rep_path.write_text(json.dumps(rep, indent=2, default=str))
     log(f"  classes: {', '.join(f'{k} {v}' for k, v in sorted(counts.items(), key=lambda t: -t[1]))}")
+    return summary
+
+
+def classify_images(input_dir: str | Path, output_dir: str | Path, model_path: str | Path | None = None, model=None,
+                    conf: float = 0.0, imgsz: int = 640, batch: int = 16, device: str | None = None,
+                    annotate: bool = True, recursive: bool = True, log=print) -> dict:
+    """Classify every image under input_dir (e.g. a folder of geotagged frames) into output_dir.
+
+    Sub-folders are kept, each with its own class folders:
+      input/13MAY2025/frame_x.jpg → output/13MAY2025/seagrass/seagrass_frame_x.jpg
+    Each output image has the class probabilities drawn on it (annotate=True) and keeps the input's EXIF
+    (GPS, time, depth), with the class and probabilities added to ImageDescription. Input files are not changed.
+    Also writes output_dir/summary.csv and classification_results.json.
+    """
+    from .pipeline import read_gps_exif
+    src_root, out = Path(input_dir).resolve(), Path(output_dir).resolve()
+    it = src_root.rglob("*") if recursive else src_root.glob("*")
+    images = sorted(p for p in it if p.is_file() and p.suffix.lower() in IMAGE_EXT and not p.name.startswith("._")
+                    and out not in p.parents)               # never re-read our own output
+    if not images:
+        raise FileNotFoundError(f"no images under {input_dir}")
+    if model is None:
+        if not model_path:
+            raise ValueError("pass model_path (the YOLO classification .pt, e.g. best.pt)")
+        model = load_model(model_path, device)
+
+    log(f"classifying {len(images)} images …")
+    names, probs = predict(model, [str(p) for p in images], imgsz, batch, device)
+    rows, counts = [], {}
+    for src, p in zip(images, probs):
+        label, c = _label(names, p, conf)
+        rel = src.parent.relative_to(src_root)
+        dest = write_classified(src, out / rel / label / classified_name(label, src), label, c, names, p, annotate)
+        try:
+            gps = read_gps_exif(src)
+        except Exception:
+            gps = None
+        rows.append({"filename": src.name, "folder": rel.as_posix() if rel.parts else "",
+                     "predicted_class": label, "confidence": round(c, 4),
+                     **{f"prob_{n}": round(float(v), 4) for n, v in zip(names, p)},
+                     "latitude": round(gps[0], 7) if gps else "", "longitude": round(gps[1], 7) if gps else "",
+                     "input_path": str(src), "output_path": str(dest)})
+        counts[label] = counts.get(label, 0) + 1
+
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "summary.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+    summary = {"images": len(rows), "class_counts": counts, "classes": names, "conf_threshold": conf,
+               "with_gps": sum(1 for r in rows if r["latitude"] != ""), "output_dir": str(out),
+               "model": str(model_path) if model_path else None,
+               "files": {"csv": str(out / "summary.csv"), "json": str(out / "classification_results.json")}}
+    (out / "classification_results.json").write_text(json.dumps({"summary": summary, "images": rows}, indent=2))
+    log(f"  classes: {', '.join(f'{k} {v}' for k, v in sorted(counts.items(), key=lambda t: -t[1]))}")
+    log(f"  GPS found in {summary['with_gps']}/{len(rows)} images; outputs in {out}")
     return summary
 
 

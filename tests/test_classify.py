@@ -1,9 +1,11 @@
 import csv
 import json
+from pathlib import Path
 
 import numpy as np
 import piexif
 import pytest
+from PIL import Image
 
 from opera_agent import classify as C
 from opera_agent import pipeline as P
@@ -64,13 +66,18 @@ def test_classify_keeps_gps_and_sorts_by_class(processed):
     assert model.calls == [2, 2, 1]                                    # batched
     assert s["class_counts"] == {"seagrass": 3, "sand": 1, "uncertain": 1}
     for r in _rows(processed):
-        copy = processed / "classified" / r["benthic_class"] / r["frame_filename"]
+        cls = r["benthic_class"]
+        copy = processed / "classified" / cls / f"{cls}_{r['frame_filename']}"   # named after its class
         assert r["classified_path"] == str(copy) and copy.exists()
         assert P.read_gps_exif(copy) == before[r["frame_filename"]]     # coordinates retained
         exif = piexif.load(str(copy))
         desc = exif["0th"][piexif.ImageIFD.ImageDescription].decode()
-        assert "echosounder depth" in desc and f"benthic class {r['benthic_class']}" in desc
+        assert "echosounder depth" in desc and f"benthic class {cls}" in desc
+        assert "probabilities: " in desc and "corals 0." in desc           # every class's probability
         assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal]            # time retained
+        original = processed / "geotagged" / r["frame_filename"]
+        assert Image.open(copy).getpixel((1, 1)) != Image.open(original).getpixel((1, 1))   # panel drawn
+        assert "probabilities: " in piexif.load(str(original))["0th"][piexif.ImageIFD.ImageDescription].decode()
         assert float(r["prob_seagrass"]) >= 0 and r["latitude"]
 
     gj = json.loads((processed / "frames.geojson").read_text())
@@ -110,3 +117,42 @@ def test_classification_failure_keeps_geotagging(survey, tmp_path):  # noqa: F81
                            log=lambda *_: None)
     assert rep["status_counts"] == {"ok": 5} and "error" in rep["classification"]
     assert "error" in json.loads((tmp_path / "out" / "report.json").read_text())["classification"]
+
+
+# ---------------------------------------------------------------- any folder of images (inference notebook)
+def test_classify_images_keeps_subfolders_and_metadata(processed, tmp_path):
+    src = tmp_path / "input"
+    for sub in ("dive1", "dive2"):
+        (src / sub).mkdir(parents=True)
+    frames = sorted((processed / "geotagged").glob("*.jpg"))
+    for f in frames[:3]:
+        (src / "dive1" / f.name).write_bytes(f.read_bytes())
+    for f in frames[3:]:
+        (src / "dive2" / f.name).write_bytes(f.read_bytes())
+    Image.new("RGB", (40, 30), (10, 20, 30)).save(src / "dive2" / "extra_2025-05-13_09-00-10.png")   # no EXIF
+    before = {p: p.read_bytes() for p in src.rglob("*") if p.is_file()}
+
+    out = tmp_path / "output"
+    s = C.classify_images(src, out, model=FakeYOLO(), conf=0.5, log=lambda *_: None)
+    assert s["images"] == 6 and s["with_gps"] == 5
+    for p, data in before.items():
+        assert p.read_bytes() == data                                          # inputs untouched
+
+    with open(out / "summary.csv") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        dest = out / r["folder"] / r["predicted_class"] / f"{r['predicted_class']}_{Path(r['filename']).stem}.jpg"
+        assert r["output_path"] == str(dest) and dest.exists()                # dive1/seagrass/seagrass_frame_…jpg
+        assert r["folder"] in ("dive1", "dive2") and "prob_seagrass" in r
+        desc = piexif.load(str(dest))["0th"][piexif.ImageIFD.ImageDescription].decode()
+        assert f"benthic class {r['predicted_class']}" in desc and "probabilities: " in desc
+        if r["latitude"]:
+            assert P.read_gps_exif(dest) == pytest.approx((float(r["latitude"]), float(r["longitude"])), abs=1e-6)
+    assert json.loads((out / "classification_results.json").read_text())["summary"]["images"] == 6
+
+
+def test_classify_images_skips_its_own_output(processed):
+    out = processed / "geotagged" / "_classified"
+    C.classify_images(processed / "geotagged", out, model=FakeYOLO(), log=lambda *_: None)
+    s = C.classify_images(processed / "geotagged", out, model=FakeYOLO(), log=lambda *_: None)
+    assert s["images"] == 5
