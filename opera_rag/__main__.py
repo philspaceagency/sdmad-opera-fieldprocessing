@@ -5,11 +5,15 @@
   python -m opera_rag search "exiftool path"          # retrieval only, no LLM
 """
 import argparse
+import sys
 
 from .rag import OperaRAG, DEFAULT_REPOS, DEFAULT_EMBED, DEFAULT_LLM
 
 
 def main():
+    from opera_agent.keys import load_keys, pop_keys_file_arg      # --keys-file, or ./api_keys.txt etc.
+    load_keys(pop_keys_file_arg(sys.argv))
+
     p = argparse.ArgumentParser(prog="opera_rag", description="RAG over OpERA repositories")
     sub = p.add_subparsers(dest="cmd", required=True)
 

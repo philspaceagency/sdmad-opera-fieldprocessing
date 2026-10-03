@@ -1,0 +1,16 @@
+# OpERA field-processing: API keys and settings for HPC / local runs.
+#
+#   cp api_keys.example.txt api_keys.txt      (api_keys.txt is git-ignored: never commit real keys)
+#   chmod 600 api_keys.txt                    (only you can read it)
+#
+# Or keep it in your home directory: ~/.config/opera/api_keys.txt, or point to it with
+# --keys-file PATH / export OPERA_KEYS_FILE=PATH. Environment variables win over this file.
+# Either "LABEL: value" or "NAME=value" works; lines starting with # are ignored.
+
+GEMINI API KEY:
+OPENROUTER API KEY:
+
+# Optional settings
+# GEMINI_MODEL=gemini-3.5-flash
+# OPENROUTER_MODEL=qwen/qwen3-235b-a22b-2507
+# OPERA_YOLO_MODEL=/path/to/yolo11l-benthic-cls.pt

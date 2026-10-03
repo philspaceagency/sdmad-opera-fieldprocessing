@@ -1,0 +1,13 @@
+# conda env create -f environment.yml && conda activate opera
+# Includes ffmpeg (often missing on HPC systems) and the YOLO classification packages.
+# For a GPU node, install a CUDA build of PyTorch that matches the cluster's driver (see the HPC section of README.md).
+name: opera
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ffmpeg
+  - pip
+  - pip:
+      - -r requirements-yolo.txt
+      - pytest
