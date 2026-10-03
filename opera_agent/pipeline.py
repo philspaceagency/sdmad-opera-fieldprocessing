@@ -414,7 +414,8 @@ def process_survey(videos_dir: str, output_dir: str, gpx: str | list[str] | None
                    interval_s: float = 1.0, tz: str = LOCAL_TZ, clock_offset_s: float = 0.0,
                    max_gap_s: float = 60.0, max_width: int | None = None, keep_untagged: bool = True,
                    recordings: list[str] | None = None, model_path: str | None = None,
-                   classify_conf: float = 0.0, log=print) -> dict:
+                   classify_conf: float = 0.0, classify_tta: str = "hflip", classify_smooth_s: float = 0.0,
+                   log=print) -> dict:
     """Videos folder + GPX → output_dir/geotagged/*.jpg, frame_data.csv, frames.geojson, report.json.
     With model_path (a YOLO classification .pt), the geotagged frames are then classified: see
     opera_agent.classify.classify_frames."""
@@ -496,7 +497,8 @@ def process_survey(videos_dir: str, output_dir: str, gpx: str | list[str] | None
         # not raised, so the geotagged result isn't lost. classify_frames can be re-run on its own.
         try:
             from .classify import classify_frames
-            report["classification"] = classify_frames(out, model_path, conf=classify_conf, log=log)
+            report["classification"] = classify_frames(out, model_path, conf=classify_conf, tta=classify_tta,
+                                                       smooth_s=classify_smooth_s, log=log)
         except Exception as e:
             log(f"  ! classification failed: {type(e).__name__}: {e}")
             report["classification"] = {"error": f"{type(e).__name__}: {e}"}

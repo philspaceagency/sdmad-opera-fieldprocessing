@@ -45,13 +45,18 @@ class OperaAgent:
     this key (404), the same conversation continues on the next model in the chain:
       primary → gemini_fallbacks (default gemini-3.5-flash-lite) → Qwen on OpenRouter.
     fallback: "auto" = add Qwen if OPENROUTER_API_KEY is set, "openrouter" = always, None = no Qwen.
-    Each new request tries the primary model first again."""
+    Each new request tries the primary model first again.
+    keys_file: API keys from a text file (see keys.py); without it ./api_keys.txt and
+    ~/.config/opera/api_keys.txt are used when present. Environment variables win over the file."""
 
     def __init__(self, data_root: str | None = None, llm_model: str | None = None, api_key: str | None = None,
                  rag=None, docs_index: str | None = None, model_path: str | None = None,
                  verbose: bool = True, max_steps: int = 25, provider: str = "gemini",
                  fallback: str | None = "auto", fallback_model: str | None = None, retries: int = 2,
-                 gemini_fallbacks: list[str] | None = None, backend=None, fallback_backends: list | None = None):
+                 gemini_fallbacks: list[str] | None = None, backend=None, fallback_backends: list | None = None,
+                 keys_file: str | None = None):
+        from .keys import load_keys
+        load_keys(keys_file, log=print if verbose else (lambda *_: None))
         self.data_root, self.verbose, self.max_steps, self.retries = data_root, verbose, max_steps, retries
         self.backend = backend or make_backend(provider, llm_model, api_key)
         if fallback_backends is None:

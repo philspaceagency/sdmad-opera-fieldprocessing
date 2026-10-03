@@ -56,10 +56,22 @@ After geotagging, `opera_agent/classify.py` runs the YOLO11 classification model
   `classified/seagrass/seagrass_frame_2025-05-13_09-00-00.jpg`, with a panel showing every class's probability
   drawn on the image and the same EXIF (`--no-annotate` skips the panel; `--organize move` removes the
   geotagged frame afterwards to save disk space, `none` only tags);
-- frames below `--conf` are labelled `uncertain`;
+- predictions are averaged over the frame and its mirror image (test-time augmentation, `--tta hflip`, the
+  default; `flips` adds vertical flips for models trained with them, `none` turns it off);
+- `--smooth 3` averages each frame's probabilities with the frames within ±1.5 s of the same recording. The bottom
+  changes slowly along a transect, so this removes single-frame flips (a fish, a blurred frame). The unsmoothed
+  class is kept in `raw_class`. Off by default;
+- frames below `--conf` are labelled `uncertain`; `class_margin` (top-1 minus top-2 probability) flags frames where
+  the model hesitated between two classes (below ~0.2: worth a look);
 - `frame_data.csv` and `frames.geojson` get `benthic_class`, `class_conf` and one `prob_<class>` column per class.
 
 Put the weights in `models/` (see `models/README.md`).
+
+**Training** (`notebooks/YOLO_classification.ipynb`) checks the dataset for near-identical frames that sit in
+different splits (they make the test score optimistic: the first model scored 100 %), trains with augmentation
+suited to top-down underwater frames (vertical + horizontal flips, colour/brightness, randaugment, erasing,
+dropout), reports per-class precision / recall / F1 with a confusion matrix and the misclassified images, picks the
+best `--tta`, and saves `best.pt` with a JSON model card. The helpers are in `opera_agent/yolo_train.py`.
 
 To classify any folder of images (e.g. frames geotagged earlier), use `notebooks/YOLO_inference.ipynb` or
 `python -m opera_agent classify-images <input_dir> <output_dir> --yolo-model …`. The output has the same
@@ -75,7 +87,7 @@ class-named, annotated images and keeps the input's sub-folders: `input/dive1/fr
 ```bash
 pip install -r requirements.txt          # plus ffmpeg on the PATH
 pip install -r requirements-yolo.txt     # only for benthic classification (adds ultralytics + PyTorch)
-export GEMINI_API_KEY=...
+export GEMINI_API_KEY=...                 # or put the keys in a file, see "API keys" below
 export OPENROUTER_API_KEY=...             # optional: Qwen fallback when Gemini is busy
 python -m opera_agent --data-root /data/surveys "process the 13MAY2025 survey"
 python -m opera_agent --chat --data-root /data/surveys
@@ -101,19 +113,61 @@ python -m opera_agent --yolo-model models/yolo11l-benthic-cls.pt --data-root /da
 | `--max-width` | full resolution | Downscales frames to this width |
 | `--yolo-model` | `$OPERA_YOLO_MODEL` | YOLO classification weights; classification is skipped without one |
 | `--conf` | 0 | Frames below this top-1 confidence are labelled `uncertain` |
+| `--tta` | `hflip` | Test-time augmentation: `none`, `hflip`, `flips` |
+| `--smooth` | 0 (off) | Average class probabilities over this many seconds of neighbouring frames |
+| `--keys-file` | see "API keys" | Text file with API keys and settings |
 
 ## Repository layout
 
 ```
-opera_agent/        pipeline.py (frames + geotagging), classify.py (YOLO), tools.py + agent.py (Gemini agent), CLI
+opera_agent/        pipeline.py (frames + geotagging), classify.py (YOLO), yolo_train.py (training checks),
+                    llm.py + tools.py + agent.py (Gemini / Qwen agent), keys.py (key file), CLI
 opera_rag/          search over the fieldprocessing repository (used by search_workflow_docs)
 notebooks/          OpERA_FieldAgent_Colab.ipynb (run the agent), YOLO_classification.ipynb (train the model),
                     YOLO_inference.ipynb (classify a folder of images)
 models/             YOLO weights go here (git-ignored)
+hpc/                example SLURM job; environment.yml: conda env with ffmpeg
+api_keys.example.txt  template for the key file (copy to api_keys.txt, which is git-ignored)
 tests/              pytest; runs without ffmpeg, a GPU or ultralytics
 ```
 
 Run the tests with `pip install pytest pillow && pytest`.
+
+## API keys (local and HPC)
+
+Colab reads the keys from its secrets. Elsewhere, set environment variables, or keep them in a text file:
+
+```bash
+cp api_keys.example.txt api_keys.txt      # git-ignored; never commit real keys
+chmod 600 api_keys.txt                    # only you can read it (a warning is printed otherwise)
+```
+
+```
+GEMINI API KEY: AIza...
+OPENROUTER API KEY: sk-or-...
+OPERA_YOLO_MODEL=/path/to/yolo11l-benthic-cls.pt     # optional settings work too
+```
+
+Both `LABEL: value` and `NAME=value` lines work. The file is found at, first match wins: `--keys-file PATH`
+(any command), `$OPERA_KEYS_FILE`, `./api_keys.txt`, `~/.config/opera/api_keys.txt`. Environment variables
+override the file. In Python: `OperaAgent(keys_file="...")`. Only the names of the settings loaded are printed,
+never the values.
+
+## Running on an HPC cluster
+
+```bash
+conda env create -f environment.yml && conda activate opera     # includes ffmpeg
+mkdir -p ~/.config/opera && cp api_keys.example.txt ~/.config/opera/api_keys.txt   # then edit + chmod 600
+mkdir -p logs && sbatch hpc/process_survey.slurm /data/surveys/13MAY2025 /data/surveys/13MAY2025_processed
+```
+
+- The direct pipeline (`process`, `classify`, `classify-images`) needs no internet, so it runs on compute nodes.
+  Put the YOLO weights on the cluster and set `OPERA_YOLO_MODEL` in the key file (or pass `--yolo-model`).
+- The natural-language agent calls Gemini / OpenRouter, so it needs outbound internet: run it on a login or
+  interactive node if compute nodes are offline.
+- For a GPU, install the PyTorch build that matches the cluster's CUDA driver
+  (e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu124`), then check with
+  `python -c "import torch; print(torch.cuda.is_available())"`.
 
 ## Language model: Gemini with a Qwen fallback
 

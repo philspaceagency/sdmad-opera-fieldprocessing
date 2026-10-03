@@ -1,5 +1,8 @@
 """Command line.
 
+  # API keys: environment variables, or a key file (see opera_agent/keys.py): --keys-file PATH,
+  # $OPERA_KEYS_FILE, ./api_keys.txt or ~/.config/opera/api_keys.txt
+
   # talk to it (needs GEMINI_API_KEY; with OPENROUTER_API_KEY set it falls back to Qwen when Gemini is busy)
   python -m opera_agent "process the GoPro videos in /data/13MAY2025 with the GPX in /data/GPX"
   python -m opera_agent --chat --data-root /data
@@ -21,6 +24,11 @@ from . import pipeline as P
 
 
 def main():
+    # --keys-file works with every subcommand; settings found there (API keys, OPERA_YOLO_MODEL, ...) go into
+    # the environment before the options below read their defaults from it
+    from .keys import load_keys, pop_keys_file_arg
+    load_keys(pop_keys_file_arg(sys.argv))
+
     if len(sys.argv) > 1 and sys.argv[1] in ("classify", "classify-images"):
         images = sys.argv[1] == "classify-images"
         p = argparse.ArgumentParser(prog=f"opera_agent {sys.argv[1]}")
@@ -34,15 +42,21 @@ def main():
         p.add_argument("--yolo-model", default=os.environ.get("OPERA_YOLO_MODEL"), help="classification .pt")
         p.add_argument("--conf", type=float, default=0.0)
         p.add_argument("--no-annotate", action="store_true", help="don't draw the class probabilities on the images")
+        p.add_argument("--tta", choices=["none", "hflip", "flips"], default="hflip",
+                       help="average over flipped views (default hflip)")
+        if not images:
+            p.add_argument("--smooth", type=float, default=0.0, metavar="SECONDS",
+                           help="average probabilities over neighbouring frames, e.g. 3 (default off)")
         a = p.parse_args()
         if not a.yolo_model:
             p.error(f"{a.cmd} needs --yolo-model (or OPERA_YOLO_MODEL)")
         from .classify import classify_frames, classify_images
         if images:
-            res = classify_images(a.input_dir, a.output_dir, a.yolo_model, conf=a.conf, annotate=not a.no_annotate)
+            res = classify_images(a.input_dir, a.output_dir, a.yolo_model, conf=a.conf, annotate=not a.no_annotate,
+                                  tta=a.tta)
         else:
             res = classify_frames(a.output_dir, a.yolo_model, conf=a.conf, organize=a.organize,
-                                  annotate=not a.no_annotate)
+                                  annotate=not a.no_annotate, tta=a.tta, smooth_s=a.smooth)
         print(json.dumps(res, indent=2))
         return
 
@@ -59,6 +73,9 @@ def main():
         p.add_argument("--yolo-model", default=os.environ.get("OPERA_YOLO_MODEL"),
                        help="classify the geotagged frames with this YOLO .pt")
         p.add_argument("--conf", type=float, default=0.0, help="below this confidence: 'uncertain'")
+        p.add_argument("--tta", choices=["none", "hflip", "flips"], default="hflip")
+        p.add_argument("--smooth", type=float, default=0.0, metavar="SECONDS",
+                       help="classification: average probabilities over neighbouring frames (default off)")
         a = p.parse_args()
         if a.cmd == "inspect":
             print(json.dumps(P.inspect(a.videos_dir, a.gpx, a.tz, a.clock_offset), indent=2, default=str))
@@ -66,7 +83,8 @@ def main():
             if not a.output_dir:
                 p.error("process needs an output_dir")
             rep = P.process_survey(a.videos_dir, a.output_dir, a.gpx, a.interval, a.tz, a.clock_offset,
-                                   a.max_gap, a.max_width, model_path=a.yolo_model, classify_conf=a.conf)
+                                   a.max_gap, a.max_width, model_path=a.yolo_model, classify_conf=a.conf,
+                                   classify_tta=a.tta, classify_smooth_s=a.smooth)
             keys = ("geotagged_dir", "frames_total", "status_counts", "files", "classification")
             print(json.dumps({k: rep[k] for k in keys if k in rep}, indent=2, default=str))
         return

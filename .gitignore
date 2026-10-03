@@ -8,8 +8,12 @@ venv/
 # Notebooks
 .ipynb_checkpoints/
 
-# Secrets
+# Secrets: API key files (api_keys.example.txt is the empty template that is committed)
 .env
+api_keys.txt
+*.keys
+*_keys.txt
+!api_keys.example.txt
 
 # Generated locally: cloned repos and docs-search indexes (opera_rag / OperaAgent)
 repos/
@@ -24,3 +28,4 @@ models/*.pt
 *.mov
 *_processed/
 runs/
+logs/
