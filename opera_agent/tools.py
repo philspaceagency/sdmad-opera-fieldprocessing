@@ -77,7 +77,10 @@ TOOLS = [
             "model_path": {"type": "string", "description": "YOLO classification weights (.pt); default: configured model"},
             "conf": {"type": "number", "description": "below this top-1 confidence the class is 'uncertain' (default 0)"},
             "organize": {"type": "string", "enum": ["copy", "move", "none"],
-                         "description": "copy (default) or move frames into classified/<class>/, or none"}},
+                         "description": "copy (default) or move frames into classified/<class>/, or none"},
+            "smooth_s": {"type": "number",
+                         "description": "average class probabilities over this many seconds of neighbouring "
+                                        "frames (e.g. 3) to remove single-frame flips; default 0 = off"}},
             "required": ["output_dir"]},
     },
     {
@@ -161,12 +164,13 @@ class ToolRunner:
             made.append(str(P.concatenate_videos(r, Path(output_dir) / f"{r.key}_concat.mp4")))
         return {"concatenated": made, "single_chapter_recordings_skipped": [r.key for r in recs if len(r.chapters) == 1]}
 
-    def t_classify_frames(self, output_dir, model_path=None, conf=0.0, organize="copy"):
+    def t_classify_frames(self, output_dir, model_path=None, conf=0.0, organize="copy", smooth_s=0.0):
         from .classify import classify_frames
         model_path = model_path or self.default_model_path
         if not model_path:
             return {"error": "no YOLO model configured; pass model_path (the classification .pt)"}
-        return classify_frames(output_dir, model_path, conf=conf, organize=organize, log=self.log)
+        return classify_frames(output_dir, model_path, conf=conf, organize=organize, smooth_s=smooth_s,
+                               log=self.log)
 
     def t_search_workflow_docs(self, query, k=5):
         if self.rag is None:

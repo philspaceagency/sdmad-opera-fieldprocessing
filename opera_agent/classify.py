@@ -24,6 +24,7 @@ import numpy as np
 from .pipeline import _frame_rows_ok
 
 UNCERTAIN = "uncertain"
+COLUMNS = ("benthic_class", "class_conf", "class_margin", "raw_class", "classified_path")   # added to frame_data.csv
 _CLASS_NOTE = "; benthic class "
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
@@ -43,18 +44,67 @@ def _probs(result) -> np.ndarray:
     return data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data, dtype=float)
 
 
-def predict(model, paths: list[str], imgsz: int = 640, batch: int = 16, device: str | None = None):
-    """(class names, probability matrix [n_images × n_classes]) for a list of image paths."""
+# Test-time augmentation: the probabilities are averaged over these views of each image. Benthic frames are
+# looked at from above, so a mirrored frame shows the same bottom type; averaging makes the result steadier.
+# "flips" also uses vertical flips: best with a model trained with flipud (notebooks/YOLO_classification.ipynb).
+TTA_VIEWS = {"none": (None,), "hflip": (None, "FLIP_LEFT_RIGHT"),
+             "flips": (None, "FLIP_LEFT_RIGHT", "FLIP_TOP_BOTTOM", "ROTATE_180")}
+
+
+def _view(path: str, op: str):
+    from PIL import Image
+    with Image.open(path) as im:
+        out = im.convert("RGB").transpose(getattr(Image.Transpose, op))
+    out.info["path"] = str(path)                   # where the view came from (logging / tests)
+    return out
+
+
+def predict(model, paths: list[str], imgsz: int = 640, batch: int = 16, device: str | None = None,
+            tta: str = "hflip"):
+    """(class names, probability matrix [n_images × n_classes]) for a list of image paths.
+    tta: "none", "hflip" (default: original + mirrored) or "flips" (+ vertical flip and 180° rotation)."""
+    if tta not in TTA_VIEWS:
+        raise ValueError(f"tta must be one of {', '.join(TTA_VIEWS)}")
+    kw = {"imgsz": imgsz, "verbose": False}
+    if device:
+        kw["device"] = device
     names, probs = None, []
     for i in range(0, len(paths), batch):
-        kw = {"imgsz": imgsz, "verbose": False}
-        if device:
-            kw["device"] = device
-        for r in model.predict(paths[i:i + batch], **kw):
+        chunk, acc = paths[i:i + batch], None
+        for op in TTA_VIEWS[tta]:
+            src = chunk if op is None else [_view(p, op) for p in chunk]
+            results = model.predict(src, **kw)
             if names is None:
-                names = [r.names[k] for k in sorted(r.names)]
-            probs.append(_probs(r))
+                names = [results[0].names[k] for k in sorted(results[0].names)]
+            p = np.stack([_probs(r) for r in results])
+            acc = p if acc is None else acc + p
+        probs.extend(acc / len(TTA_VIEWS[tta]))
     return names or [], np.array(probs)
+
+
+def smooth_over_time(probs: np.ndarray, times: list[float], groups: list[str], window_s: float) -> np.ndarray:
+    """Average each frame's probabilities with those of the frames within ±window_s/2 seconds of the same
+    recording. The bottom changes slowly along a transect, so this removes single-frame flips between classes
+    (a passing fish, a blurred frame) without blurring real boundaries much. window_s <= 0: unchanged."""
+    if window_s <= 0 or len(probs) == 0:
+        return probs
+    out = np.empty_like(probs, dtype=float)
+    times, groups = np.asarray(times, dtype=float), np.asarray(groups)
+    for g in np.unique(groups):
+        idx = np.flatnonzero(groups == g)
+        idx = idx[np.argsort(times[idx], kind="stable")]
+        t = times[idx]
+        csum = np.vstack([np.zeros(probs.shape[1]), np.cumsum(probs[idx], axis=0)])
+        lo = np.searchsorted(t, t - window_s / 2, side="left")
+        hi = np.searchsorted(t, t + window_s / 2, side="right")
+        out[idx] = (csum[hi] - csum[lo]) / (hi - lo)[:, None]
+    return out
+
+
+def margin(p) -> float:
+    """Top-1 minus top-2 probability: small (< ~0.2) means the model hesitated between two classes."""
+    s = np.sort(np.asarray(p, dtype=float))
+    return float(s[-1] - s[-2]) if len(s) > 1 else float(s[-1])
 
 
 def prob_text(names: list[str], p) -> str:
@@ -161,7 +211,8 @@ def _label(names: list[str], p, conf: float) -> tuple[str, float]:
 
 def classify_frames(output_dir: str | Path, model_path: str | Path | None = None, model=None,
                     conf: float = 0.0, imgsz: int = 640, batch: int = 16, device: str | None = None,
-                    organize: str = "copy", annotate: bool = True, log=print) -> dict:
+                    organize: str = "copy", annotate: bool = True, tta: str = "hflip", smooth_s: float = 0.0,
+                    log=print) -> dict:
     """Classify the geotagged frames of a process_survey output folder.
 
     conf: frames whose top-1 confidence is below this are labelled 'uncertain'.
@@ -169,6 +220,9 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
     frame, 'move' removes the geotagged frame afterwards (saves disk; the CSV path column follows it),
     'none' only tags EXIF and the tables.
     annotate: draw the class probabilities on the classified copies (EXIF is kept either way).
+    tta: test-time augmentation, see TTA_VIEWS ("hflip" by default).
+    smooth_s: average probabilities over this many seconds of neighbouring frames of the same recording
+    (e.g. 3); the per-frame (unsmoothed) class is kept in the raw_class column. 0 = off.
     """
     if organize not in ("copy", "move", "none"):
         raise ValueError("organize must be 'copy', 'move' or 'none'")
@@ -188,13 +242,16 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
 
     # drop columns from an earlier classification so a re-run with another model starts clean
     for r in rows:
-        for k in [k for k in r if k in ("benthic_class", "class_conf", "classified_path") or k.startswith("prob_")]:
+        for k in [k for k in r if k in COLUMNS or k.startswith("prob_")]:
             del r[k]
 
     log(f"  classifying {len(ok)} geotagged frames …")
-    names, probs = predict(model, [r["path"] for r in ok], imgsz, batch, device)
+    names, raw = predict(model, [r["path"] for r in ok], imgsz, batch, device, tta)
+    from datetime import datetime
+    probs = smooth_over_time(raw, [datetime.fromisoformat(r["frame_datetime"]).timestamp() for r in ok],
+                             [r["recording"] for r in ok], smooth_s)
     counts: dict[str, int] = {}
-    for r, p in zip(ok, probs):
+    for r, p, p_raw in zip(ok, probs, raw):
         label, c = _label(names, p, conf)
         src = Path(r["path"])
         write_class_exif(src, label, c, prob_text(names, p))
@@ -204,14 +261,16 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
             if organize == "move":
                 src.unlink()
                 r["path"] = str(dest)
-        r["benthic_class"], r["class_conf"] = label, round(c, 4)
+        r["benthic_class"], r["class_conf"], r["class_margin"] = label, round(c, 4), round(margin(p), 4)
+        if smooth_s > 0:
+            r["raw_class"] = _label(names, p_raw, conf)[0]
         r["classified_path"] = str(dest)
         for n, v in zip(names, p):
             r[f"prob_{n}"] = round(float(v), 4)
         counts[label] = counts.get(label, 0) + 1
 
     # ---- tables: every row gets the same columns (blank for untagged frames)
-    extra = ["benthic_class", "class_conf", "classified_path"] + [f"prob_{n}" for n in names]
+    extra = [c for c in COLUMNS if c != "raw_class" or smooth_s > 0] + [f"prob_{n}" for n in names]
     fields = [k for k in rows[0] if k not in extra] + extra
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, restval="")
@@ -227,7 +286,9 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
 
     summary = {"classified": len(ok), "class_counts": counts, "classes": names,
                "conf_threshold": conf, "model": str(model_path) if model_path else None,
-               "classified_dir": str(class_dir) if organize != "none" else None, "organize": organize}
+               "classified_dir": str(class_dir) if organize != "none" else None, "organize": organize,
+               "tta": tta, "smooth_s": smooth_s,
+               "low_margin_frames": sum(1 for r in ok if r["class_margin"] < 0.2)}
     try:
         summary["qa_map"] = str(_class_plot(ok, out / "qa_class_map.png"))
     except Exception as e:
@@ -243,7 +304,7 @@ def classify_frames(output_dir: str | Path, model_path: str | Path | None = None
 
 def classify_images(input_dir: str | Path, output_dir: str | Path, model_path: str | Path | None = None, model=None,
                     conf: float = 0.0, imgsz: int = 640, batch: int = 16, device: str | None = None,
-                    annotate: bool = True, recursive: bool = True, log=print) -> dict:
+                    annotate: bool = True, recursive: bool = True, tta: str = "hflip", log=print) -> dict:
     """Classify every image under input_dir (e.g. a folder of geotagged frames) into output_dir.
 
     Sub-folders are kept, each with its own class folders:
@@ -265,7 +326,7 @@ def classify_images(input_dir: str | Path, output_dir: str | Path, model_path: s
         model = load_model(model_path, device)
 
     log(f"classifying {len(images)} images …")
-    names, probs = predict(model, [str(p) for p in images], imgsz, batch, device)
+    names, probs = predict(model, [str(p) for p in images], imgsz, batch, device, tta)
     rows, counts = [], {}
     for src, p in zip(images, probs):
         label, c = _label(names, p, conf)
@@ -276,7 +337,7 @@ def classify_images(input_dir: str | Path, output_dir: str | Path, model_path: s
         except Exception:
             gps = None
         rows.append({"filename": src.name, "folder": rel.as_posix() if rel.parts else "",
-                     "predicted_class": label, "confidence": round(c, 4),
+                     "predicted_class": label, "confidence": round(c, 4), "margin": round(margin(p), 4),
                      **{f"prob_{n}": round(float(v), 4) for n, v in zip(names, p)},
                      "latitude": round(gps[0], 7) if gps else "", "longitude": round(gps[1], 7) if gps else "",
                      "input_path": str(src), "output_path": str(dest)})
@@ -285,7 +346,7 @@ def classify_images(input_dir: str | Path, output_dir: str | Path, model_path: s
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
-    summary = {"images": len(rows), "class_counts": counts, "classes": names, "conf_threshold": conf,
+    summary = {"images": len(rows), "class_counts": counts, "classes": names, "conf_threshold": conf, "tta": tta,
                "with_gps": sum(1 for r in rows if r["latitude"] != ""), "output_dir": str(out),
                "model": str(model_path) if model_path else None,
                "files": {"csv": str(out / "summary.csv"), "json": str(out / "classification_results.json")}}

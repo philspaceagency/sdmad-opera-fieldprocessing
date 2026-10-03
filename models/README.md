@@ -5,6 +5,8 @@ Put the YOLO benthic classification weights here, e.g. `models/yolo11l-benthic-c
 
 The weights come from `notebooks/YOLO_classification.ipynb` (`<run>/weights/best.pt`,
 YOLO11-large classification, classes: corals, macroalgae, rubble, sand, seagrass).
+The notebook saves them with a `<name>.json` model card: classes, test metrics, `recommended_tta`
+(pass it as `--tta`) and the training settings.
 
 Classification needs `pip install -r requirements-yolo.txt` (ultralytics + PyTorch). Use the weights with:
 

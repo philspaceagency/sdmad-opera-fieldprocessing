@@ -28,12 +28,16 @@ class FakeYOLO:
     """Stands in for ultralytics.YOLO: seagrass for frames whose name ends in an even second, else sand
     (with low confidence for :05 so the threshold can be tested)."""
     def __init__(self):
-        self.calls = []
+        self.calls, self.views = [], 0
 
     def predict(self, paths, **kw):
-        self.calls.append(len(paths))
         out = []
+        if paths and not isinstance(paths[0], str):            # flipped views (test-time augmentation)
+            self.views += len(paths)
+        else:
+            self.calls.append(len(paths))
         for p in paths:
+            p = p if isinstance(p, str) else p.info["path"]
             sec = int(str(p)[-6:-4])
             if sec == 5:
                 out.append(_Result([0.1, 0.2, 0.2, 0.3, 0.2]))
@@ -156,3 +160,51 @@ def test_classify_images_skips_its_own_output(processed):
     C.classify_images(processed / "geotagged", out, model=FakeYOLO(), log=lambda *_: None)
     s = C.classify_images(processed / "geotagged", out, model=FakeYOLO(), log=lambda *_: None)
     assert s["images"] == 5
+
+
+# ---------------------------------------------------------------- test-time augmentation, smoothing, margin
+class MirrorDisagrees(FakeYOLO):
+    """Says seagrass on the original, sand on every flipped view."""
+    def predict(self, paths, **kw):
+        flipped = paths and not isinstance(paths[0], str)
+        self.views += len(paths) if flipped else 0
+        return [_Result([0, 0, 0, 0.8, 0.2] if flipped else [0, 0, 0, 0.2, 0.8]) for _ in paths]
+
+
+def test_tta_averages_views(processed):
+    paths = [str(p) for p in sorted((processed / "geotagged").glob("*.jpg"))]
+    m = MirrorDisagrees()
+    names, p = C.predict(m, paths, batch=2, tta="hflip")
+    assert m.views == 5 and np.allclose(p[:, 3], 0.5) and np.allclose(p[:, 4], 0.5)
+    _, p = C.predict(MirrorDisagrees(), paths, tta="flips")
+    assert np.allclose(p[:, 4], (0.8 + 3 * 0.2) / 4)
+    _, p = C.predict(MirrorDisagrees(), paths, tta="none")
+    assert np.allclose(p[:, 4], 0.8)
+    with pytest.raises(ValueError):
+        C.predict(m, paths, tta="rotate")
+
+
+def test_smooth_over_time_stays_within_recording():
+    probs = np.array([[1, 0], [1, 0], [0, 1], [1, 0], [1, 0], [0, 1]], dtype=float)
+    times = [0, 1, 2, 3, 4, 2]
+    groups = ["A", "A", "A", "A", "A", "B"]
+    out = C.smooth_over_time(probs, times, groups, window_s=3)              # ±1.5 s → 3 neighbouring frames
+    assert out[2].tolist() == pytest.approx([2 / 3, 1 / 3])                  # the lone flip is outvoted
+    assert out[0].tolist() == pytest.approx([1, 0])                          # edge: only itself + next
+    assert out[5].tolist() == [0, 1]                                         # other recording untouched
+    assert C.smooth_over_time(probs, times, groups, 0) is probs
+
+
+def test_margin():
+    assert C.margin([0.1, 0.6, 0.3]) == pytest.approx(0.3)
+
+
+def test_classify_frames_with_smoothing_keeps_raw_class(processed):
+    s = C.classify_frames(processed, model=FakeYOLO(), conf=0.4, smooth_s=12, log=lambda *_: None)
+    rows = _rows(processed)
+    assert s["smooth_s"] == 12 and s["tta"] == "hflip"
+    assert {"raw_class", "class_margin"} <= set(rows[0])
+    assert [r["raw_class"] for r in rows] == ["seagrass", "uncertain", "seagrass", "sand", "seagrass"]
+    # ±6 s with frames 5 s apart → each frame averaged with its neighbours, e.g. :05 = mean of :00, :05, :10
+    assert [r["benthic_class"] for r in rows] == ["seagrass", "seagrass", "sand", "seagrass", "seagrass"]
+    assert float(rows[1]["prob_seagrass"]) == pytest.approx((0.95 + 0.2 + 0.95) / 3, abs=1e-4)
